@@ -7,7 +7,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
+use ratatui::symbols::{self, line};
+use ratatui::widgets::{Block, Borders, LineGauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{TerminalOptions, Viewport};
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,13 @@ use std::time::Duration;
 /// Lines reserved for the selector (`draw_selector` vertical constraints sum to this).
 const SELECTOR_VIEWPORT_HEIGHT: u16 = 45;
 
-pub fn run_tui(url: String, output_dir: PathBuf) -> Result<()> {
+#[derive(Debug)]
+pub enum TuiExit {
+    Quit,
+    DownloadOk(Vec<PathBuf>),
+}
+
+pub fn run_tui(url: String, output_dir: PathBuf) -> Result<TuiExit> {
     let rt = tokio::runtime::Runtime::new()?;
 
     enable_raw_mode()?;
@@ -43,7 +50,7 @@ enum Screen {
         status_line: String,
         pct: Option<f64>,
         prog_rx: mpsc::Receiver<String>,
-        done_rx: mpsc::Receiver<Result<(), String>>,
+        done_rx: mpsc::Receiver<Result<Vec<PathBuf>, String>>,
     },
     Message {
         title: String,
@@ -109,7 +116,7 @@ fn run_ui_loop(
     rt: tokio::runtime::Runtime,
     url: String,
     output_dir: PathBuf,
-) -> Result<()> {
+) -> Result<TuiExit> {
     let (load_tx, load_rx) = mpsc::channel();
     let u = url.clone();
     rt.spawn(async move {
@@ -119,7 +126,7 @@ fn run_ui_loop(
 
     let mut screen = Screen::Loading;
 
-    'outer: loop {
+    let exit = 'outer: loop {
         terminal.draw(|f| {
             let area = f.area();
             match &screen {
@@ -132,21 +139,31 @@ fn run_ui_loop(
                 Screen::Downloading {
                     status_line, pct, ..
                 } => {
+                    let block = Block::default().borders(Borders::ALL).title("ytdlp-tui");
+                    let inner = block.inner(area);
+                    f.render_widget(block, area);
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
-                        .constraints([Constraint::Length(3), Constraint::Min(0)])
-                        .split(area);
-                    let p = Paragraph::new("Download in progress")
-                        .block(Block::default().borders(Borders::ALL).title("ytdlp-tui"));
-                    f.render_widget(p, chunks[0]);
-                    let label = status_line.as_str();
-                    let ratio = pct.map(|p| p / 100.0).unwrap_or(0.0);
-                    let g = Gauge::default()
-                        .block(Block::default().borders(Borders::ALL))
-                        .gauge_style(Style::default().fg(Color::Green))
-                        .ratio(ratio.clamp(0.0, 1.0))
-                        .label(label);
-                    f.render_widget(g, chunks[1]);
+                        .constraints([
+                            Constraint::Min(1),
+                            Constraint::Length(1),
+                        ])
+                        .split(inner);
+                    let path_text = format!("Save to: {}", output_dir.display());
+                    let path_para = Paragraph::new(path_text).wrap(Wrap { trim: true });
+                    f.render_widget(path_para, chunks[0]);
+                    let ratio = pct.map(|p| p / 100.0).unwrap_or(0.0).clamp(0.0, 1.0);
+                    let tqdm_line_set = line::Set {
+                        horizontal: symbols::bar::FULL,
+                        ..line::NORMAL
+                    };
+                    let lg = LineGauge::default()
+                        .filled_style(Style::default().fg(Color::Green))
+                        .unfilled_style(Style::default().fg(Color::DarkGray))
+                        .line_set(tqdm_line_set)
+                        .ratio(ratio)
+                        .label(Line::from(status_line.as_str()));
+                    f.render_widget(lg, chunks[1]);
                 }
                 Screen::Message { title, body } => {
                     let p = Paragraph::new(format!(
@@ -203,12 +220,7 @@ fn run_ui_loop(
             }
             if let Ok(done) = done_rx.try_recv() {
                 match done {
-                    Ok(()) => {
-                        screen = Screen::Message {
-                            title: "Done".into(),
-                            body: "Download finished.".into(),
-                        };
-                    }
+                    Ok(paths) => break 'outer TuiExit::DownloadOk(paths),
                     Err(msg) => {
                         screen = Screen::Message {
                             title: "Error".into(),
@@ -236,12 +248,12 @@ fn run_ui_loop(
                     Screen::Loading => {}
                     Screen::Message { .. } => {
                         if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-                            break 'outer;
+                            break 'outer TuiExit::Quit;
                         }
                     }
                     Screen::Downloading { .. } => {}
                     Screen::Selector(s) => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break 'outer,
+                        KeyCode::Char('q') | KeyCode::Esc => break 'outer TuiExit::Quit,
                         KeyCode::Tab => s.focus = s.focus.next(),
                         KeyCode::BackTab => s.focus = s.focus.prev(),
                         KeyCode::Char(' ') => match s.focus {
@@ -274,7 +286,7 @@ fn run_ui_loop(
                                     done_rx,
                                 };
                             }
-                            Focus::Quit => break 'outer,
+                            Focus::Quit => break 'outer TuiExit::Quit,
                             _ => {}
                         },
                         _ => {}
@@ -283,9 +295,9 @@ fn run_ui_loop(
             }
             _ => {}
         }
-    }
+    };
 
-    Ok(())
+    Ok(exit)
 }
 
 fn adjust_selector(s: &mut SelectorState, delta: i32) {

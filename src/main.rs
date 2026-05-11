@@ -25,6 +25,19 @@ fn main() -> Result<()> {
         .output_dir
         .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
     let out = out.canonicalize().unwrap_or(out);
-    app::run_tui(cli.url, out)?;
+    match app::run_tui(cli.url, out.clone())? {
+        app::TuiExit::DownloadOk(paths) => {
+            println!("Saved:");
+            if paths.is_empty() {
+                println!(" {}", out.display());
+            } else {
+                for p in paths {
+                    let display = std::fs::canonicalize(&p).unwrap_or(p);
+                    println!(" {}", display.display());
+                }
+            }
+        }
+        app::TuiExit::Quit => {}
+    }
     Ok(())
 }

@@ -4,9 +4,13 @@ use crate::models::{DownloadChoices, VideoInfo, VideoPick, VideoVariant};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+/// Printed to stdout by `--print` after each file is moved; parsed in `run_download`.
+const PRINT_FILEPATH_PREFIX: &str = "ytdlp-tui-out:";
 
 fn yt_dlp_bin() -> &'static str {
     if cfg!(windows) {
@@ -225,6 +229,8 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
         "--no-warnings".into(),
         "--newline".into(),
         "--progress".into(),
+        "-O".into(),
+        format!("after_move:{PRINT_FILEPATH_PREFIX}%(filepath)s"),
         "-o".into(),
         outtmpl,
     ];
@@ -284,7 +290,7 @@ pub async fn run_download(
     video: &VideoInfo,
     choices: &DownloadChoices,
     progress: std::sync::mpsc::Sender<String>,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     let args = download_args(video, choices)?;
     let mut child = Command::new(yt_dlp_bin())
         .args(&args)
@@ -297,16 +303,27 @@ pub async fn run_download(
     let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
     let progress_out = progress.clone();
+    let prefix = PRINT_FILEPATH_PREFIX.to_string();
     let stdout_task = async move {
         let mut reader = BufReader::new(stdout).lines();
+        let mut paths = Vec::<PathBuf>::new();
         while let Some(line) = reader.next_line().await? {
-            if let Some(pct) = parse_progress_line(&line) {
+            let line = line.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix(prefix.as_str()) {
+                let path = rest.trim();
+                if !path.is_empty() {
+                    let p = PathBuf::from(path);
+                    if !paths.contains(&p) {
+                        paths.push(p);
+                    }
+                }
+            } else if let Some(pct) = parse_progress_line(line) {
                 let _ = progress_out.send(format!("Downloading… {pct:.1}%"));
             } else if line.contains("[download]") {
                 let _ = progress_out.send("Downloading…".to_string());
             }
         }
-        Ok::<(), std::io::Error>(())
+        Ok::<Vec<PathBuf>, std::io::Error>(paths)
     };
 
     let stderr_task = async move {
@@ -319,7 +336,7 @@ pub async fn run_download(
     };
 
     let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
-    stdout_res.context("read yt-dlp stdout")?;
+    let paths = stdout_res.context("read yt-dlp stdout")?;
     let err_text = stderr_res.context("read yt-dlp stderr")?;
 
     let status = child.wait().await.context("wait for yt-dlp")?;
@@ -333,7 +350,7 @@ pub async fn run_download(
         return Err(anyhow!("{stderr_joined}"));
     }
 
-    Ok(())
+    Ok(paths)
 }
 
 #[cfg(test)]
