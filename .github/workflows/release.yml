@@ -16,8 +16,6 @@ jobs:
         include:
           - os: macos-14
             artifact_name: ytdlp-tui-macos-arm64
-          - os: macos-13
-            artifact_name: ytdlp-tui-macos-x86_64
           - os: ubuntu-latest
             artifact_name: ytdlp-tui-linux-x86_64
           - os: windows-latest

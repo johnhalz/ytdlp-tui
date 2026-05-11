@@ -12,8 +12,7 @@ class YtdlpTui < Formula
       url "https://github.com/johnhalz/ytdlp-tui/releases/download/v#{version}/ytdlp-tui-macos-arm64"
       sha256 "REPLACE_SHA256_MACOS_ARM64"
     else
-      url "https://github.com/johnhalz/ytdlp-tui/releases/download/v#{version}/ytdlp-tui-macos-x86_64"
-      sha256 "REPLACE_SHA256_MACOS_X86_64"
+      odie "ytdlp-tui: Intel Mac binaries are not built in CI; install with pip, uv, or PyPI."
     end
   end
 
@@ -27,7 +26,7 @@ class YtdlpTui < Formula
 
   def install
     binary = if OS.mac?
-      Hardware::CPU.arm? ? "ytdlp-tui-macos-arm64" : "ytdlp-tui-macos-x86_64"
+      "ytdlp-tui-macos-arm64"
     else
       "ytdlp-tui-linux-x86_64"
     end
