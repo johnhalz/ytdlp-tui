@@ -167,6 +167,10 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
         args.push("best".into());
     }
 
+    if choices.embed_chapters {
+        args.push("--embed-chapters".into());
+    }
+
     args.push(video.url.clone());
     Ok(args)
 }

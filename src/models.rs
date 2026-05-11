@@ -20,6 +20,7 @@ pub struct DownloadChoices {
     pub audio_only: bool,
     pub audio_format: String,
     pub subtitle_langs: Vec<String>,
+    pub embed_chapters: bool,
 }
 
 pub const MERGE_FORMATS: &[&str] = &["mp4", "mkv", "webm"];

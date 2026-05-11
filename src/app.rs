@@ -54,6 +54,7 @@ struct SelectorState {
     audio_fmt_idx: usize,
     sub_cursor: usize,
     subs_on: Vec<bool>,
+    embed_chapters: bool,
     focus: Focus,
 }
 
@@ -64,6 +65,7 @@ enum Focus {
     AudioOnly,
     AudioFmt,
     Subtitles,
+    EmbedChapters,
     Download,
     Quit,
 }
@@ -75,7 +77,8 @@ impl Focus {
             Focus::Merge => Focus::AudioOnly,
             Focus::AudioOnly => Focus::AudioFmt,
             Focus::AudioFmt => Focus::Subtitles,
-            Focus::Subtitles => Focus::Download,
+            Focus::Subtitles => Focus::EmbedChapters,
+            Focus::EmbedChapters => Focus::Download,
             Focus::Download => Focus::Quit,
             Focus::Quit => Focus::Resolution,
         }
@@ -88,7 +91,8 @@ impl Focus {
             Focus::AudioOnly => Focus::Merge,
             Focus::AudioFmt => Focus::AudioOnly,
             Focus::Subtitles => Focus::AudioFmt,
-            Focus::Download => Focus::Subtitles,
+            Focus::EmbedChapters => Focus::Subtitles,
+            Focus::Download => Focus::EmbedChapters,
             Focus::Quit => Focus::Download,
         }
     }
@@ -161,6 +165,7 @@ fn run_ui_loop(
                             audio_fmt_idx: 0,
                             sub_cursor: 0,
                             subs_on: vec![false; n],
+                            embed_chapters: true,
                             focus: Focus::Resolution,
                         });
                     }
@@ -237,6 +242,7 @@ fn run_ui_loop(
                     KeyCode::BackTab => s.focus = s.focus.prev(),
                     KeyCode::Char(' ') => match s.focus {
                         Focus::AudioOnly => s.audio_only = !s.audio_only,
+                        Focus::EmbedChapters => s.embed_chapters = !s.embed_chapters,
                         Focus::Subtitles if !s.video.subtitle_langs.is_empty() => {
                             let i = s.sub_cursor.min(s.subs_on.len().saturating_sub(1));
                             if i < s.subs_on.len() {
@@ -323,6 +329,7 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
         audio_only: s.audio_only,
         audio_format,
         subtitle_langs,
+        embed_chapters: s.embed_chapters,
     }
 }
 
@@ -337,6 +344,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             Constraint::Length(3),
             Constraint::Length(6),
             Constraint::Length(8),
+            Constraint::Length(3),
             Constraint::Length(4),
         ])
         .split(area);
@@ -508,6 +516,24 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         chunks[6],
     );
 
+    let ec_border = if matches!(s.focus, Focus::EmbedChapters) {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    f.render_widget(
+        Paragraph::new(format!(
+            "Embed chapters: {}  |  Focus here and press Space to toggle",
+            if s.embed_chapters { "yes" } else { "no" }
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(ec_border),
+        ),
+        chunks[7],
+    );
+
     let action_border = if matches!(s.focus, Focus::Download | Focus::Quit) {
         Style::default().fg(Color::Yellow)
     } else {
@@ -522,5 +548,5 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         "Actions\n\n{focus_hint}\n\n(q or Esc) quit from any screen except message"
     ))
     .block(Block::default().borders(Borders::ALL).border_style(action_border));
-    f.render_widget(actions, chunks[7]);
+    f.render_widget(actions, chunks[8]);
 }
