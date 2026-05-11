@@ -16,6 +16,16 @@ This project is a **Rust** binary. It shells out to the **`yt-dlp`** executable 
 cargo install ytdlp-tui
 ```
 
+## Updating
+
+Rebuild and reinstall the latest crates.io release (overwrites the previous install):
+
+```bash
+cargo install ytdlp-tui --force
+```
+
+See what is installed with `cargo install --list`; check the binary with `ytdlp-tui --version`.
+
 ## Usage
 
 ```bash
