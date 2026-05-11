@@ -1,6 +1,6 @@
 [package]
 name = "ytdlp-tui"
-version = "0.3.1"
+version = "0.4.0"
 authors = ["ytdlp-tui contributors"]
 edition = "2021"
 description = "Interactive terminal UI for yt-dlp downloads."

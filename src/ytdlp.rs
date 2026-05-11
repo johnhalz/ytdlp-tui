@@ -30,7 +30,9 @@ fn collect_heights(formats: &[Value]) -> Vec<u32> {
             continue;
         };
         let Some(h) = fmt.height else { continue };
-        let Some(vc) = fmt.vcodec.as_deref() else { continue };
+        let Some(vc) = fmt.vcodec.as_deref() else {
+            continue;
+        };
         if vc == "none" {
             continue;
         }
@@ -75,7 +77,10 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let msg = stderr.trim();
         if msg.is_empty() {
-            return Err(anyhow!("yt-dlp exited with status {:?}", output.status.code()));
+            return Err(anyhow!(
+                "yt-dlp exited with status {:?}",
+                output.status.code()
+            ));
         }
         return Err(anyhow!("{msg}"));
     }
@@ -149,9 +154,7 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
         args.push(choices.merge_format.clone());
         let fmt = match choices.height_cap {
             None => "bestvideo+bestaudio/best".to_string(),
-            Some(h) => format!(
-                "bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-            ),
+            Some(h) => format!("bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"),
         };
         args.push("-f".into());
         args.push(fmt);
@@ -200,14 +203,8 @@ pub async fn run_download(
         .spawn()
         .with_context(|| format!("failed to spawn `{}`", yt_dlp_bin()))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("no stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("no stderr"))?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
     let progress_out = progress.clone();
     let stdout_task = async move {
@@ -235,19 +232,13 @@ pub async fn run_download(
     stdout_res.context("read yt-dlp stdout")?;
     let err_text = stderr_res.context("read yt-dlp stderr")?;
 
-    let status = child
-        .wait()
-        .await
-        .context("wait for yt-dlp")?;
+    let status = child.wait().await.context("wait for yt-dlp")?;
 
     let stderr_joined = err_text.join("\n");
 
     if !status.success() {
         if stderr_joined.is_empty() {
-            return Err(anyhow!(
-                "yt-dlp failed with status {:?}",
-                status.code()
-            ));
+            return Err(anyhow!("yt-dlp failed with status {:?}", status.code()));
         }
         return Err(anyhow!("{stderr_joined}"));
     }
@@ -269,4 +260,3 @@ mod tests {
         assert_eq!(parse_progress_line("not progress"), None);
     }
 }
-

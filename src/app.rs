@@ -4,31 +4,34 @@ use crate::models::{DownloadChoices, VideoInfo, AUDIO_FORMATS, MERGE_FORMATS};
 use crate::ytdlp;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
+use ratatui::{TerminalOptions, Viewport};
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Lines reserved for the selector (`draw_selector` vertical constraints sum to this).
+const SELECTOR_VIEWPORT_HEIGHT: u16 = 43;
+
 pub fn run_tui(url: String, output_dir: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     enable_raw_mode()?;
-    let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(out);
-    let mut terminal = Terminal::new(backend)?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(SELECTOR_VIEWPORT_HEIGHT),
+        },
+    )?;
 
     let r = run_ui_loop(&mut terminal, rt, url, output_dir);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     r
 }
@@ -42,7 +45,10 @@ enum Screen {
         prog_rx: mpsc::Receiver<String>,
         done_rx: mpsc::Receiver<Result<(), String>>,
     },
-    Message { title: String, body: String },
+    Message {
+        title: String,
+        body: String,
+    },
 }
 
 struct SelectorState {
@@ -217,65 +223,65 @@ fn run_ui_loop(
             continue;
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
+        match event::read()? {
+            Event::Resize(_, _) => {
+                terminal.autoresize()?;
+            }
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
 
-        match &mut screen {
-            Screen::Loading => {}
-            Screen::Message { .. } => {
-                if matches!(
-                    key.code,
-                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')
-                ) {
-                    break 'outer;
-                }
-            }
-            Screen::Downloading { .. } => {}
-            Screen::Selector(s) => {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break 'outer,
-                    KeyCode::Tab => s.focus = s.focus.next(),
-                    KeyCode::BackTab => s.focus = s.focus.prev(),
-                    KeyCode::Char(' ') => match s.focus {
-                        Focus::AudioOnly => s.audio_only = !s.audio_only,
-                        Focus::EmbedChapters => s.embed_chapters = !s.embed_chapters,
-                        Focus::Subtitles if !s.video.subtitle_langs.is_empty() => {
-                            let i = s.sub_cursor.min(s.subs_on.len().saturating_sub(1));
-                            if i < s.subs_on.len() {
-                                s.subs_on[i] = !s.subs_on[i];
+                match &mut screen {
+                    Screen::Loading => {}
+                    Screen::Message { .. } => {
+                        if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                            break 'outer;
+                        }
+                    }
+                    Screen::Downloading { .. } => {}
+                    Screen::Selector(s) => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break 'outer,
+                        KeyCode::Tab => s.focus = s.focus.next(),
+                        KeyCode::BackTab => s.focus = s.focus.prev(),
+                        KeyCode::Char(' ') => match s.focus {
+                            Focus::AudioOnly => s.audio_only = !s.audio_only,
+                            Focus::EmbedChapters => s.embed_chapters = !s.embed_chapters,
+                            Focus::Subtitles if !s.video.subtitle_langs.is_empty() => {
+                                let i = s.sub_cursor.min(s.subs_on.len().saturating_sub(1));
+                                if i < s.subs_on.len() {
+                                    s.subs_on[i] = !s.subs_on[i];
+                                }
                             }
-                        }
+                            _ => {}
+                        },
+                        KeyCode::Up => adjust_selector(s, -1),
+                        KeyCode::Down => adjust_selector(s, 1),
+                        KeyCode::Enter => match s.focus {
+                            Focus::Download => {
+                                let choices = build_choices(s, output_dir.clone());
+                                let (prog_tx, prog_rx) = mpsc::channel();
+                                let (done_tx, done_rx) = mpsc::channel();
+                                let video = s.video.clone();
+                                rt.spawn(async move {
+                                    let r = ytdlp::run_download(&video, &choices, prog_tx).await;
+                                    let _ = done_tx.send(r.map_err(|e| e.to_string()));
+                                });
+                                screen = Screen::Downloading {
+                                    status_line: "Starting download…".into(),
+                                    pct: None,
+                                    prog_rx,
+                                    done_rx,
+                                };
+                            }
+                            Focus::Quit => break 'outer,
+                            _ => {}
+                        },
                         _ => {}
                     },
-                    KeyCode::Up => adjust_selector(s, -1),
-                    KeyCode::Down => adjust_selector(s, 1),
-                    KeyCode::Enter => match s.focus {
-                        Focus::Download => {
-                            let choices = build_choices(s, output_dir.clone());
-                            let (prog_tx, prog_rx) = mpsc::channel();
-                            let (done_tx, done_rx) = mpsc::channel();
-                            let video = s.video.clone();
-                            rt.spawn(async move {
-                                let r = ytdlp::run_download(&video, &choices, prog_tx).await;
-                                let _ = done_tx.send(r.map_err(|e| e.to_string()));
-                            });
-                            screen = Screen::Downloading {
-                                status_line: "Starting download…".into(),
-                                pct: None,
-                                prog_rx,
-                                done_rx,
-                            };
-                        }
-                        Focus::Quit => break 'outer,
-                        _ => {}
-                    },
-                    _ => {}
                 }
             }
+            _ => {}
         }
     }
 
@@ -354,11 +360,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         chunks[0],
     );
 
-    let mut meta = format!(
-        "URL: {}\nSave to: {}",
-        s.video.url,
-        output_dir.display()
-    );
+    let mut meta = format!("URL: {}\nSave to: {}", s.video.url, output_dir.display());
     if let Some(ref t) = s.video.thumbnail {
         meta.push_str(&format!("\nThumbnail: {t}"));
     }
@@ -368,7 +370,12 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
     );
 
     let res_items: Vec<ListItem> = std::iter::once(ListItem::new("Best available"))
-        .chain(s.video.heights.iter().map(|h| ListItem::new(format!("{h}p"))))
+        .chain(
+            s.video
+                .heights
+                .iter()
+                .map(|h| ListItem::new(format!("{h}p"))),
+        )
         .collect();
     let res_border = if matches!(s.focus, Focus::Resolution) {
         Style::default().fg(Color::Yellow)
@@ -491,30 +498,41 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
     } else {
         Style::default()
     };
-    let sub_lines: Vec<ListItem> = if s.video.subtitle_langs.is_empty() {
-        vec![ListItem::new("(no subtitles reported)")]
+    if s.video.subtitle_langs.is_empty() {
+        f.render_widget(
+            List::new(vec![ListItem::new("(no subtitles reported)")]).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(sub_border)
+                    .title("Subtitles (↑↓ Space toggles)"),
+            ),
+            chunks[6],
+        );
     } else {
-        s.video
+        let sub_items: Vec<ListItem> = s
+            .video
             .subtitle_langs
             .iter()
             .enumerate()
             .map(|(i, lang)| {
                 let on = s.subs_on.get(i).copied().unwrap_or(false);
                 let mark = if on { "[x]" } else { "[ ]" };
-                let hl = if i == s.sub_cursor { ">> " } else { "   " };
-                ListItem::new(format!("{hl}{mark} {lang}"))
+                ListItem::new(format!("{mark} {lang}"))
             })
-            .collect()
-    };
-    f.render_widget(
-        List::new(sub_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(sub_border)
-                .title("Subtitles (↑↓ Space toggles)"),
-        ),
-        chunks[6],
-    );
+            .collect();
+        let mut sub_state = ListState::default();
+        sub_state.select(Some(s.sub_cursor));
+        let sub_list = List::new(sub_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(sub_border)
+                    .title("Subtitles (↑↓ Space toggles)"),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .highlight_symbol("> ");
+        f.render_stateful_widget(sub_list, chunks[6], &mut sub_state);
+    }
 
     let ec_border = if matches!(s.focus, Focus::EmbedChapters) {
         Style::default().fg(Color::Yellow)
@@ -547,6 +565,10 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
     let actions = Paragraph::new(format!(
         "Actions\n\n{focus_hint}\n\n(q or Esc) quit from any screen except message"
     ))
-    .block(Block::default().borders(Borders::ALL).border_style(action_border));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(action_border),
+    );
     f.render_widget(actions, chunks[8]);
 }
