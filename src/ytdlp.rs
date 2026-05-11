@@ -1,10 +1,10 @@
 //! Invoke `yt-dlp` as a subprocess for metadata and downloads.
 
-use crate::models::{DownloadChoices, VideoInfo, VideoPick, VideoVariant};
+use crate::models::{Chapter, DownloadChoices, VideoInfo, VideoPick, VideoVariant};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -152,6 +152,31 @@ fn collect_subtitle_langs(info: &Value) -> Vec<String> {
     v
 }
 
+fn collect_chapters(info: &Value) -> Vec<Chapter> {
+    let Some(arr) = info.get("chapters").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in arr {
+        let start_time = c.get("start_time").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let title = c
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(Chapter {
+            title,
+            start_time,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.start_time
+            .partial_cmp(&b.start_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
 pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
     let output = Command::new(yt_dlp_bin())
         .args([
@@ -198,6 +223,7 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
 
     let variants = collect_video_variants(&formats);
     let subtitle_langs = collect_subtitle_langs(&info);
+    let chapters = collect_chapters(&info);
 
     Ok(VideoInfo {
         url: url.to_string(),
@@ -205,6 +231,7 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
         thumbnail,
         variants,
         subtitle_langs,
+        chapters,
     })
 }
 
@@ -353,6 +380,336 @@ pub async fn run_download(
     Ok(paths)
 }
 
+fn ffmpeg_bin() -> &'static str {
+    if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
+}
+
+fn ffprobe_bin() -> &'static str {
+    if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    }
+}
+
+fn merge_cuts(mut cuts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    cuts.retain(|(s, e)| e > s && s.is_finite() && e.is_finite());
+    if cuts.is_empty() {
+        return Vec::new();
+    }
+    cuts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = vec![cuts[0]];
+    for (s, e) in cuts.into_iter().skip(1) {
+        let last = out.last_mut().expect("non-empty");
+        if s <= last.1 {
+            last.1 = last.1.max(e);
+        } else {
+            out.push((s, e));
+        }
+    }
+    out
+}
+
+fn removed_before(merged: &[(f64, f64)], t: f64) -> f64 {
+    merged
+        .iter()
+        .map(|&(s, e)| {
+            if t <= s {
+                0.0
+            } else {
+                (e.min(t) - s).max(0.0)
+            }
+        })
+        .sum()
+}
+
+fn adjust_time(merged: &[(f64, f64)], t: f64) -> f64 {
+    t - removed_before(merged, t)
+}
+
+fn start_inside_cut(t: f64, merged: &[(f64, f64)]) -> bool {
+    merged.iter().any(|&(s, e)| t >= s && t < e)
+}
+
+fn keep_intervals(duration: f64, merged: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let duration = duration.max(0.0);
+    let mut keeps = Vec::new();
+    let mut cursor = 0.0_f64;
+    for &(s, e) in merged {
+        let s = s.clamp(0.0, duration);
+        let e = e.clamp(0.0, duration);
+        if cursor + 1e-6 < s {
+            keeps.push((cursor, s));
+        }
+        cursor = cursor.max(e);
+        if cursor >= duration - 1e-9 {
+            break;
+        }
+    }
+    if cursor + 1e-6 < duration {
+        keeps.push((cursor, duration));
+    }
+    keeps.retain(|(a, b)| b - a > 1e-4);
+    keeps
+}
+
+async fn probe_duration(path: &Path) -> Result<f64> {
+    let output = Command::new(ffprobe_bin())
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .with_context(|| format!("failed to run `{}` — is it on your PATH?", ffprobe_bin()))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffprobe failed: {err}"));
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let trimmed = s.trim();
+    trimmed
+        .parse::<f64>()
+        .with_context(|| format!("invalid duration from ffprobe: {trimmed:?}"))
+}
+
+fn concat_list_line(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\'', "'\\''");
+    format!("file '{s}'")
+}
+
+fn escape_ffmeta_value(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\\' => "\\\\".to_string(),
+            '#' => "\\#".to_string(),
+            ';' => "\\;".to_string(),
+            '=' => "\\=".to_string(),
+            '[' => "\\[".to_string(),
+            ']' => "\\]".to_string(),
+            '\n' | '\r' => " ".to_string(),
+            _ => c.to_string(),
+        })
+        .collect()
+}
+
+fn build_ffmetadata(chapters: &[(String, f64, f64)]) -> String {
+    let mut w = String::from(";FFMETADATA1\n");
+    for (title, start, end) in chapters {
+        let title_esc = escape_ffmeta_value(title);
+        let start_us = (*start * 1_000_000.0).round() as i64;
+        let end_us = (*end * 1_000_000.0).round() as i64;
+        w.push_str("[CHAPTER]\n");
+        w.push_str("TIMEBASE=1/1000000\n");
+        w.push_str(&format!("START={start_us}\n"));
+        w.push_str(&format!("END={end_us}\n"));
+        w.push_str(&format!("title={title_esc}\n"));
+    }
+    w
+}
+
+/// Remove time ranges from `input` in-place using ffmpeg concat (`-c copy`).
+/// When `chapters` is non-empty, writes adjusted chapter metadata.
+pub async fn cut_segments(input: &Path, cuts: &[(f64, f64)], chapters: &[Chapter]) -> Result<()> {
+    if cuts.is_empty() {
+        return Ok(());
+    }
+    if !input.is_file() {
+        return Err(anyhow!("not a file: {:?}", input));
+    }
+
+    let merged = merge_cuts(cuts.to_vec());
+    if merged.is_empty() {
+        return Ok(());
+    }
+
+    let duration = probe_duration(input).await?;
+    let keeps = keep_intervals(duration, &merged);
+    if keeps.is_empty() {
+        return Err(anyhow!("cut segments cover the entire video; nothing left to save"));
+    }
+
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ytdlp-tui");
+    let ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mkv");
+
+    let mut part_paths = Vec::new();
+    for (i, &(a, b)) in keeps.iter().enumerate() {
+        let dur = b - a;
+        if dur <= 1e-6 {
+            continue;
+        }
+        let part = parent.join(format!("{stem}.ytdlp-tui-part{i}.{ext}"));
+        let status = Command::new(ffmpeg_bin())
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-ss")
+            .arg(format!("{a}"))
+            .arg("-i")
+            .arg(input)
+            .arg("-t")
+            .arg(format!("{dur}"))
+            .arg("-c")
+            .arg("copy")
+            .arg("-avoid_negative_ts")
+            .arg("make_zero")
+            .arg(&part)
+            .status()
+            .await
+            .with_context(|| format!("failed to run `{}`", ffmpeg_bin()))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&part);
+            return Err(anyhow!("ffmpeg failed extracting segment {i}"));
+        }
+        part_paths.push(part);
+    }
+
+    if part_paths.is_empty() {
+        return Err(anyhow!("no segments produced for concat"));
+    }
+
+    let list_path = parent.join(format!("{stem}.ytdlp-tui-concat.txt"));
+    let list_body = part_paths
+        .iter()
+        .map(|p| concat_list_line(p.as_path()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&list_path, format!("{list_body}\n"))
+        .with_context(|| format!("write concat list {:?}", list_path))?;
+
+    let new_duration = adjust_time(&merged, duration);
+    let adjusted_chapters: Vec<(String, f64, f64)> = if chapters.is_empty() {
+        Vec::new()
+    } else {
+        let mut adjusted_starts: Vec<f64> = Vec::new();
+        let mut titles: Vec<String> = Vec::new();
+        for ch in chapters {
+            if start_inside_cut(ch.start_time, &merged) {
+                continue;
+            }
+            let ns = adjust_time(&merged, ch.start_time);
+            adjusted_starts.push(ns);
+            titles.push(ch.title.clone());
+        }
+        let mut out: Vec<(String, f64, f64)> = Vec::new();
+        for i in 0..adjusted_starts.len() {
+            let start = adjusted_starts[i];
+            let end = if i + 1 < adjusted_starts.len() {
+                adjusted_starts[i + 1]
+            } else {
+                new_duration
+            };
+            if end > start + 1e-6 {
+                out.push((titles[i].clone(), start, end));
+            }
+        }
+        out
+    };
+
+    let tmp_out = parent.join(format!("{stem}.ytdlp-tui-cut-out.{ext}"));
+    let meta_path = parent.join(format!("{stem}.ytdlp-tui-chapters.ffmeta"));
+
+    let wrote_meta = if adjusted_chapters.is_empty() {
+        false
+    } else {
+        let meta_body = build_ffmetadata(&adjusted_chapters);
+        std::fs::write(&meta_path, meta_body)
+            .with_context(|| format!("write ffmetadata {:?}", meta_path))?;
+        true
+    };
+
+    let success = if !wrote_meta {
+        Command::new(ffmpeg_bin())
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("concat")
+            .arg("-safe")
+            .arg("0")
+            .arg("-i")
+            .arg(&list_path)
+            .arg("-map")
+            .arg("0")
+            .arg("-c")
+            .arg("copy")
+            .arg(&tmp_out)
+            .status()
+            .await
+            .with_context(|| format!("failed to run `{}`", ffmpeg_bin()))?
+            .success()
+    } else {
+        Command::new(ffmpeg_bin())
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("concat")
+            .arg("-safe")
+            .arg("0")
+            .arg("-i")
+            .arg(&list_path)
+            .arg("-f")
+            .arg("ffmetadata")
+            .arg("-i")
+            .arg(&meta_path)
+            .arg("-map_metadata")
+            .arg("1")
+            .arg("-map_chapters")
+            .arg("1")
+            .arg("-map")
+            .arg("0")
+            .arg("-c")
+            .arg("copy")
+            .arg(&tmp_out)
+            .status()
+            .await
+            .with_context(|| format!("failed to run `{}`", ffmpeg_bin()))?
+            .success()
+    };
+
+    for p in &part_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_file(&list_path);
+    if wrote_meta {
+        let _ = std::fs::remove_file(&meta_path);
+    }
+
+    if !success {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Err(anyhow!("ffmpeg concat or metadata merge failed"));
+    }
+
+    let backup = parent.join(format!("{stem}.ytdlp-tui-before-cut.{ext}"));
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(input, &backup).with_context(|| "backup original before replace")?;
+    std::fs::rename(&tmp_out, input).with_context(|| "replace with cut file")?;
+    std::fs::remove_file(&backup).ok();
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +822,7 @@ mod tests {
             thumbnail: None,
             variants: vec![],
             subtitle_langs: vec![],
+            chapters: vec![],
         };
         let choices = DownloadChoices {
             output_dir: std::env::temp_dir(),
@@ -476,6 +834,8 @@ mod tests {
             audio_format: "mp3".into(),
             subtitle_langs: vec![],
             embed_chapters: false,
+            chapters: vec![],
+            cut_segments: vec![],
         };
         let args = download_args(&video, &choices).expect("args");
         let f_pos = args.iter().position(|a| a == "-f").unwrap();

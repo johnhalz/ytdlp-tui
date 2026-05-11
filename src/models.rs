@@ -12,6 +12,13 @@ pub struct VideoVariant {
     pub video_format_id: String,
 }
 
+/// Chapter marker from yt-dlp metadata (`--embed-chapters` source).
+#[derive(Debug, Clone)]
+pub struct Chapter {
+    pub title: String,
+    pub start_time: f64,
+}
+
 impl VideoVariant {
     /// TUI label: `{h}p · {fps}fps · {DR}` with segments omitted when `fps` is missing or DR is `Unknown`.
     pub fn label(&self) -> String {
@@ -42,6 +49,7 @@ pub struct VideoInfo {
     /// Best-first distinct video variants (height · fps · dynamic range).
     pub variants: Vec<VideoVariant>,
     pub subtitle_langs: Vec<String>,
+    pub chapters: Vec<Chapter>,
 }
 
 /// How to pick the video stream for a merged download.
@@ -64,6 +72,10 @@ pub struct DownloadChoices {
     pub audio_format: String,
     pub subtitle_langs: Vec<String>,
     pub embed_chapters: bool,
+    /// Original chapter times from metadata; used when rewriting chapters after sponsor cuts.
+    pub chapters: Vec<Chapter>,
+    /// Time ranges (seconds) to remove from the downloaded file(s).
+    pub cut_segments: Vec<(f64, f64)>,
 }
 
 pub const MERGE_FORMATS: &[&str] = &["mp4", "mkv", "webm"];

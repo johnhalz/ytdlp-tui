@@ -1,14 +1,14 @@
 # ytdlp-tui
 
-Interactive terminal UI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Pass a URL, choose resolution, container format, audio-only mode, and subtitles, then download with a simple progress view.
+Interactive terminal UI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Pass a URL, choose resolution, container format, audio-only mode, and subtitles, optionally select [SponsorBlock](https://sponsor.ajay.app/) segments to cut out after download, then download with a simple progress view.
 
-This project is a **Rust** binary. It shells out to the **`yt-dlp`** executable on your `PATH` (same as using yt-dlp from the CLI).
+This project is a **Rust** binary. It shells out to the **`yt-dlp`** executable on your `PATH` (same as using yt-dlp from the CLI). Sponsor segments are fetched over HTTPS; cutting uses **`ffmpeg`** (and **`ffprobe`** for duration).
 
 ## Requirements
 
 - **Rust** toolchain (for `cargo install`)
 - **`yt-dlp`** on your `PATH`
-- **FFmpeg** on your `PATH` when merging video+audio or converting audio (same as plain yt-dlp)
+- **FFmpeg** and **ffprobe** on your `PATH` when merging video+audio, converting audio, or **removing selected SponsorBlock segments** after download (same merging needs as plain yt-dlp)
 
 ## Install
 
@@ -35,9 +35,9 @@ ytdlp-tui --output-dir ~/Downloads "https://..."
 
 ### Controls (selector screen)
 
-- **Tab** / **Shift+Tab** — cycle focus (resolution, container, audio-only, audio format, subtitles, actions)
+- **Tab** / **Shift+Tab** — cycle focus (resolution, container, audio-only, audio format, subtitles, embed chapters, SponsorBlock, actions)
 - **↑** / **↓** — change the focused option
-- **Space** — toggle **Audio only** or the focused subtitle language
+- **Space** — toggle **Audio only**, **Embed chapters**, **SponsorBlock** cut (when that row is focused), or the focused subtitle language
 - **Enter** — start download (when **Download** is focused) or quit (when **Quit** is focused)
 - **q** / **Esc** — exit
 

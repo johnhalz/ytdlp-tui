@@ -2,6 +2,7 @@
 
 mod app;
 mod models;
+mod sponsorblock;
 mod ytdlp;
 
 use anyhow::Result;

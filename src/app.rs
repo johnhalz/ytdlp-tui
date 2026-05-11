@@ -1,6 +1,7 @@
 //! Ratatui event loop and screens.
 
 use crate::models::{DownloadChoices, VideoInfo, VideoPick, AUDIO_FORMATS, MERGE_FORMATS};
+use crate::sponsorblock::{self, SponsorSegment};
 use crate::ytdlp;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -16,7 +17,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// Lines reserved for the selector (`draw_selector` vertical constraints sum to this).
-const SELECTOR_VIEWPORT_HEIGHT: u16 = 45;
+const SELECTOR_VIEWPORT_HEIGHT: u16 = 53;
 
 #[derive(Debug)]
 pub enum TuiExit {
@@ -51,6 +52,11 @@ enum Screen {
         pct: Option<f64>,
         prog_rx: mpsc::Receiver<String>,
         done_rx: mpsc::Receiver<Result<Vec<PathBuf>, String>>,
+        choices: DownloadChoices,
+    },
+    PostProcessing {
+        status_line: String,
+        done_rx: mpsc::Receiver<Result<Vec<PathBuf>, String>>,
     },
     Message {
         title: String,
@@ -68,6 +74,10 @@ struct SelectorState {
     sub_cursor: usize,
     subs_on: Vec<bool>,
     embed_chapters: bool,
+    sponsor_segments: Vec<SponsorSegment>,
+    /// Parallel to `sponsor_segments`: include this range in the ffmpeg cut step.
+    sponsor_cut: Vec<bool>,
+    sponsor_cursor: usize,
     focus: Focus,
 }
 
@@ -79,6 +89,7 @@ enum Focus {
     AudioFmt,
     Subtitles,
     EmbedChapters,
+    SponsorBlock,
     Download,
     Quit,
 }
@@ -91,7 +102,8 @@ impl Focus {
             Focus::AudioOnly => Focus::AudioFmt,
             Focus::AudioFmt => Focus::Subtitles,
             Focus::Subtitles => Focus::EmbedChapters,
-            Focus::EmbedChapters => Focus::Download,
+            Focus::EmbedChapters => Focus::SponsorBlock,
+            Focus::SponsorBlock => Focus::Download,
             Focus::Download => Focus::Quit,
             Focus::Quit => Focus::Resolution,
         }
@@ -105,7 +117,8 @@ impl Focus {
             Focus::AudioFmt => Focus::AudioOnly,
             Focus::Subtitles => Focus::AudioFmt,
             Focus::EmbedChapters => Focus::Subtitles,
-            Focus::Download => Focus::EmbedChapters,
+            Focus::SponsorBlock => Focus::EmbedChapters,
+            Focus::Download => Focus::SponsorBlock,
             Focus::Quit => Focus::Download,
         }
     }
@@ -120,8 +133,18 @@ fn run_ui_loop(
     let (load_tx, load_rx) = mpsc::channel();
     let u = url.clone();
     rt.spawn(async move {
-        let r = ytdlp::fetch_video_info(&u).await;
-        let _ = load_tx.send(r.map_err(|e| e.to_string()));
+        let (video_r, segs_r) = tokio::join!(
+            ytdlp::fetch_video_info(&u),
+            sponsorblock::fetch_segments(&u),
+        );
+        let res = match video_r {
+            Err(e) => Err(e.to_string()),
+            Ok(v) => {
+                let segs = segs_r.unwrap_or_else(|_| Vec::new());
+                Ok((v, segs))
+            }
+        };
+        let _ = load_tx.send(res);
     });
 
     let mut screen = Screen::Loading;
@@ -131,8 +154,10 @@ fn run_ui_loop(
             let area = f.area();
             match &screen {
                 Screen::Loading => {
-                    let p = Paragraph::new(format!("Loading metadata…\n\n{url}"))
-                        .block(Block::default().borders(Borders::ALL).title("ytdlp-tui"));
+                    let p = Paragraph::new(format!(
+                        "Loading metadata and SponsorBlock segments…\n\n{url}"
+                    ))
+                    .block(Block::default().borders(Borders::ALL).title("ytdlp-tui"));
                     f.render_widget(p, area);
                 }
                 Screen::Selector(s) => draw_selector(f, area, s, &output_dir),
@@ -165,6 +190,11 @@ fn run_ui_loop(
                         .label(Line::from(status_line.as_str()));
                     f.render_widget(lg, chunks[1]);
                 }
+                Screen::PostProcessing { status_line, .. } => {
+                    let p = Paragraph::new(status_line.as_str())
+                        .block(Block::default().borders(Borders::ALL).title("ytdlp-tui"));
+                    f.render_widget(p, area);
+                }
                 Screen::Message { title, body } => {
                     let p = Paragraph::new(format!(
                         "{title}\n\n{body}\n\nPress Enter, Esc, or q to close."
@@ -178,8 +208,9 @@ fn run_ui_loop(
         if matches!(screen, Screen::Loading) {
             if let Ok(r) = load_rx.try_recv() {
                 match r {
-                    Ok(v) => {
+                    Ok((v, segs)) => {
                         let n = v.subtitle_langs.len();
+                        let sn = segs.len();
                         screen = Screen::Selector(SelectorState {
                             video: v,
                             resolution_idx: 0,
@@ -189,6 +220,9 @@ fn run_ui_loop(
                             sub_cursor: 0,
                             subs_on: vec![false; n],
                             embed_chapters: true,
+                            sponsor_segments: segs,
+                            sponsor_cut: vec![false; sn],
+                            sponsor_cursor: 0,
                             focus: Focus::Resolution,
                         });
                     }
@@ -206,7 +240,7 @@ fn run_ui_loop(
             status_line,
             pct,
             prog_rx,
-            done_rx,
+            ..
         } = &mut screen
         {
             while let Ok(msg) = prog_rx.try_recv() {
@@ -218,8 +252,52 @@ fn run_ui_loop(
                 }
                 *status_line = msg;
             }
+        }
+
+        if let Screen::Downloading { done_rx, choices, .. } = &mut screen {
             if let Ok(done) = done_rx.try_recv() {
                 match done {
+                    Ok(paths) => {
+                        let c = choices.clone();
+                        if c.cut_segments.is_empty()
+                            || !paths.iter().any(|p| is_probably_video_path(p))
+                        {
+                            break 'outer TuiExit::DownloadOk(paths);
+                        }
+                        let (post_done_tx, post_done_rx) = mpsc::channel();
+                        let post_paths = paths.clone();
+                        rt.spawn(async move {
+                            let ch = c.chapters.clone();
+                            let cuts = c.cut_segments.clone();
+                            for p in &post_paths {
+                                if !is_probably_video_path(p) {
+                                    continue;
+                                }
+                                if let Err(e) = ytdlp::cut_segments(p, &cuts, &ch).await {
+                                    let _ = post_done_tx.send(Err(e.to_string()));
+                                    return;
+                                }
+                            }
+                            let _ = post_done_tx.send(Ok(post_paths));
+                        });
+                        screen = Screen::PostProcessing {
+                            status_line: "Removing selected segments (ffmpeg)…".into(),
+                            done_rx: post_done_rx,
+                        };
+                    }
+                    Err(msg) => {
+                        screen = Screen::Message {
+                            title: "Error".into(),
+                            body: msg,
+                        };
+                    }
+                }
+            }
+        }
+
+        if let Screen::PostProcessing { done_rx, .. } = &mut screen {
+            if let Ok(r) = done_rx.try_recv() {
+                match r {
                     Ok(paths) => break 'outer TuiExit::DownloadOk(paths),
                     Err(msg) => {
                         screen = Screen::Message {
@@ -252,6 +330,7 @@ fn run_ui_loop(
                         }
                     }
                     Screen::Downloading { .. } => {}
+                    Screen::PostProcessing { .. } => {}
                     Screen::Selector(s) => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break 'outer TuiExit::Quit,
                         KeyCode::Tab => s.focus = s.focus.next(),
@@ -265,6 +344,14 @@ fn run_ui_loop(
                                     s.subs_on[i] = !s.subs_on[i];
                                 }
                             }
+                            Focus::SponsorBlock if !s.sponsor_segments.is_empty() => {
+                                let i = s
+                                    .sponsor_cursor
+                                    .min(s.sponsor_cut.len().saturating_sub(1));
+                                if i < s.sponsor_cut.len() {
+                                    s.sponsor_cut[i] = !s.sponsor_cut[i];
+                                }
+                            }
                             _ => {}
                         },
                         KeyCode::Up => adjust_selector(s, -1),
@@ -272,11 +359,13 @@ fn run_ui_loop(
                         KeyCode::Enter => match s.focus {
                             Focus::Download => {
                                 let choices = build_choices(s, output_dir.clone());
+                                let dl_choices = choices.clone();
                                 let (prog_tx, prog_rx) = mpsc::channel();
                                 let (done_tx, done_rx) = mpsc::channel();
                                 let video = s.video.clone();
                                 rt.spawn(async move {
-                                    let r = ytdlp::run_download(&video, &choices, prog_tx).await;
+                                    let r =
+                                        ytdlp::run_download(&video, &dl_choices, prog_tx).await;
                                     let _ = done_tx.send(r.map_err(|e| e.to_string()));
                                 });
                                 screen = Screen::Downloading {
@@ -284,6 +373,7 @@ fn run_ui_loop(
                                     pct: None,
                                     prog_rx,
                                     done_rx,
+                                    choices,
                                 };
                             }
                             Focus::Quit => break 'outer TuiExit::Quit,
@@ -322,6 +412,11 @@ fn adjust_selector(s: &mut SelectorState, delta: i32) {
             let i = (s.sub_cursor as i32 + delta).clamp(0, max as i32) as usize;
             s.sub_cursor = i;
         }
+        Focus::SponsorBlock if !s.sponsor_segments.is_empty() => {
+            let max = s.sponsor_segments.len().saturating_sub(1);
+            let i = (s.sponsor_cursor as i32 + delta).clamp(0, max as i32) as usize;
+            s.sponsor_cursor = i;
+        }
         _ => {}
     }
 }
@@ -345,6 +440,12 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
             subtitle_langs.push(lang.clone());
         }
     }
+    let mut cut_segments = Vec::new();
+    for (i, seg) in s.sponsor_segments.iter().enumerate() {
+        if s.sponsor_cut.get(i) == Some(&true) {
+            cut_segments.push((seg.start, seg.end));
+        }
+    }
     DownloadChoices {
         output_dir,
         video_pick,
@@ -353,6 +454,8 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
         audio_format,
         subtitle_langs,
         embed_chapters: s.embed_chapters,
+        chapters: s.video.chapters.clone(),
+        cut_segments,
     }
 }
 
@@ -368,6 +471,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(3),
+            Constraint::Length(8),
             Constraint::Length(4),
         ])
         .split(area);
@@ -569,6 +673,54 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         chunks[7],
     );
 
+    let sb_border = if matches!(s.focus, Focus::SponsorBlock) {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    if s.sponsor_segments.is_empty() {
+        f.render_widget(
+            Paragraph::new("(no SponsorBlock segments for this video)").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(sb_border)
+                    .title("SponsorBlock (↑↓ Space toggles cut)")
+                    .style(Style::default().fg(Color::DarkGray)),
+            ),
+            chunks[8],
+        );
+    } else {
+        let sb_items: Vec<ListItem> = s
+            .sponsor_segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                let on = s.sponsor_cut.get(i).copied().unwrap_or(false);
+                let mark = if on { "[x]" } else { "[ ]" };
+                ListItem::new(format!(
+                    "{mark} {} – {}  •  {}",
+                    format_timestamp(seg.start),
+                    format_timestamp(seg.end),
+                    seg.category
+                ))
+            })
+            .collect();
+        let mut sb_state = ListState::default();
+        sb_state.select(Some(
+            s.sponsor_cursor.min(s.sponsor_segments.len().saturating_sub(1)),
+        ));
+        let sb_list = List::new(sb_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(sb_border)
+                    .title("SponsorBlock (↑↓ Space toggles cut)"),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .highlight_symbol("> ");
+        f.render_stateful_widget(sb_list, chunks[8], &mut sb_state);
+    }
+
     let action_border = if matches!(s.focus, Focus::Download | Focus::Quit) {
         Style::default().fg(Color::Yellow)
     } else {
@@ -587,5 +739,22 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             .borders(Borders::ALL)
             .border_style(action_border),
     );
-    f.render_widget(actions, chunks[8]);
+    f.render_widget(actions, chunks[9]);
+}
+
+fn format_timestamp(sec: f64) -> String {
+    let s = sec.max(0.0);
+    let frac = ((s - s.floor()) * 100.0).round() as u32;
+    let t = s.floor() as u64;
+    let h = t / 3600;
+    let m = (t % 3600) / 60;
+    let s0 = t % 60;
+    format!("{h:02}:{m:02}:{s0:02}.{frac:02}")
+}
+
+fn is_probably_video_path(p: &Path) -> bool {
+    const EXT: &[&str] = &["mkv", "mp4", "webm", "m4v", "mov", "avi"];
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXT.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
