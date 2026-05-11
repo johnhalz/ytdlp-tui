@@ -290,6 +290,9 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
     })
 }
 
+/// Prefer streams yt-dlp marks as original in `format_note`; fallback to plain `bestaudio`.
+const BESTAUDIO_PREFER_ORIGINAL: &str = "(bestaudio[format_note*=original]/bestaudio)";
+
 /// Build download arguments (including the URL at the end).
 fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<String>> {
     if !choices.output_dir.as_path().is_dir() {
@@ -322,7 +325,7 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
             .audio_track
             .as_deref()
             .map(|id| format!("{id}/best"))
-            .unwrap_or_else(|| "bestaudio/best".to_string());
+            .unwrap_or_else(|| format!("{BESTAUDIO_PREFER_ORIGINAL}/best"));
         args.push("-f".into());
         args.push(src);
         args.push("-x".into());
@@ -337,7 +340,7 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
             .audio_track
             .as_deref()
             .map(|id| id.to_string())
-            .unwrap_or_else(|| "bestaudio".to_string());
+            .unwrap_or_else(|| BESTAUDIO_PREFER_ORIGINAL.to_string());
         let fmt = match &choices.video_pick {
             VideoPick::Best => format!("bestvideo+{audio_part}/best"),
             VideoPick::ByFormatId { video_format_id } => {
@@ -906,7 +909,81 @@ mod tests {
         };
         let args = download_args(&video, &choices).expect("args");
         let f_pos = args.iter().position(|a| a == "-f").unwrap();
-        assert_eq!(args.get(f_pos + 1), Some(&"401+bestaudio/best".to_string()));
+        assert_eq!(
+            args.get(f_pos + 1),
+            Some(&format!("401+{BESTAUDIO_PREFER_ORIGINAL}/best"))
+        );
+    }
+
+    #[test]
+    fn download_args_default_audio_prefers_original_merged_best_video() {
+        let video = VideoInfo {
+            url: "https://example.com".into(),
+            title: "t".into(),
+            thumbnail: None,
+            variants: vec![],
+            audio_tracks: vec![],
+            subtitle_langs: vec![],
+            chapters: vec![],
+        };
+        let choices = DownloadChoices {
+            output_dir: std::env::temp_dir(),
+            video_pick: VideoPick::Best,
+            merge_format: "mkv".into(),
+            audio_track: None,
+            audio_only: false,
+            audio_format: "mp3".into(),
+            subtitle_langs: vec![],
+            embed_chapters: false,
+            chapters: vec![],
+            cut_segments: vec![],
+        };
+        let args = download_args(&video, &choices).expect("args");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        let f = args.get(f_pos + 1).expect("-f value");
+        assert!(
+            f.contains("format_note*=original"),
+            "expected original preference in -f, got {f:?}"
+        );
+        assert!(
+            f.ends_with("/best"),
+            "expected fallback /best suffix, got {f:?}"
+        );
+        assert_eq!(
+            f.as_str(),
+            format!("bestvideo+{BESTAUDIO_PREFER_ORIGINAL}/best")
+        );
+    }
+
+    #[test]
+    fn download_args_default_audio_prefers_original_audio_only() {
+        let video = VideoInfo {
+            url: "https://example.com".into(),
+            title: "t".into(),
+            thumbnail: None,
+            variants: vec![],
+            audio_tracks: vec![],
+            subtitle_langs: vec![],
+            chapters: vec![],
+        };
+        let choices = DownloadChoices {
+            output_dir: std::env::temp_dir(),
+            video_pick: VideoPick::Best,
+            merge_format: "mkv".into(),
+            audio_track: None,
+            audio_only: true,
+            audio_format: "mp3".into(),
+            subtitle_langs: vec![],
+            embed_chapters: false,
+            chapters: vec![],
+            cut_segments: vec![],
+        };
+        let args = download_args(&video, &choices).expect("args");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        let f = args.get(f_pos + 1).expect("-f value");
+        assert!(f.contains("format_note*=original"));
+        assert!(f.ends_with("/best"));
+        assert_eq!(f.as_str(), format!("{BESTAUDIO_PREFER_ORIGINAL}/best"));
     }
 
     #[test]
