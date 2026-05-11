@@ -42,7 +42,7 @@ cargo run -- "https://www.youtube.com/watch?v=..."
 ## GitHub Actions
 
 - **CI** runs `cargo test` and `cargo build --release` on pushes and PRs to `main`.
-- **Publish** runs `cargo publish` when a `v*` tag is pushed. Add a repository secret **`CARGO_REGISTRY_TOKEN`** with a [crates.io token](https://crates.io/settings/tokens).
+- **Publish** runs when a **`v*`** tag is pushed (`v0.3.0`, etc.): one job creates the **GitHub Release** from that tag (with generated notes); another publishes to crates.io (requires **`CARGO_REGISTRY_TOKEN`** with a [crates.io token](https://crates.io/settings/tokens)). Tag the commit whose **`Cargo.toml`** version matches the tag (after bumping to `0.3.0`, run `git tag v0.3.0` and push the tag).
 
 ## License
 
