@@ -36,14 +36,14 @@ ytdlp-tui -o ~/Downloads "https://..."
 
 ## Binary releases (GitHub)
 
-Tagged releases attach standalone binaries built with PyInstaller (no Python needed). See [Releases](https://github.com/OWNER/yt-dlp-tui/releases) after you publish the repo.
+Tagged releases attach standalone binaries built with PyInstaller (no Python needed). See [Releases](https://github.com/johnhalz/ytdlp-tui/releases).
 
 ### Homebrew (separate tap)
 
-Create a tap repository (for example `homebrew-ytdlp-tui`) and add the formula from [`docs/homebrew-ytdlp-tui.rb`](docs/homebrew-ytdlp-tui.rb), updating `OWNER`, version, and per-arch `url`/`sha256` values to match the release assets. Then:
+Create a tap repository (for example `homebrew-ytdlp-tui`) and add the formula from [`docs/homebrew-ytdlp-tui.rb`](docs/homebrew-ytdlp-tui.rb), updating version and per-arch `sha256` values to match the release assets. Then:
 
 ```bash
-brew tap OWNER/ytdlp-tui
+brew tap johnhalz/ytdlp-tui
 brew install ytdlp-tui
 ```
 
@@ -58,7 +58,7 @@ choco install ytdlp-tui
 ## Packaging maintainers
 
 - **GitHub release:** push a tag `v*`; the workflow uploads `ytdlp-tui`/`.exe` plus `.sha256` files (filenames match `artifact_name` in the workflow).
-- **Homebrew:** copy [`docs/homebrew-ytdlp-tui.rb`](docs/homebrew-ytdlp-tui.rb) into a tap; set `OWNER`, version, and SHA256s from the release assets.
+- **Homebrew:** copy [`docs/homebrew-ytdlp-tui.rb`](docs/homebrew-ytdlp-tui.rb) into a tap; set version and SHA256s from the release assets.
 - **Chocolatey:** edit `chocolatey/tools/chocolateyInstall.ps1` (version, checksum, URL), then `cd chocolatey && choco pack ytdlp-tui.nuspec` and `choco push`.
 
 ## Development
