@@ -4,9 +4,9 @@
 build/
 dist/
 
-# Legacy Python leftovers
-__pycache__/
-*.py[cod]
+# Python / uv virtualenv (local only)
+.venv/
+venv/
 
 # IDE / env
 .idea/

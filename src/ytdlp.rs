@@ -53,7 +53,7 @@ fn collect_subtitle_langs(info: &Value) -> Vec<String> {
         }
     }
     let mut v: Vec<String> = langs.into_iter().collect();
-    v.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    v.sort_by_key(|a| a.to_lowercase());
     v
 }
 
@@ -111,7 +111,7 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
 }
 
 /// Build download arguments (including the URL at the end).
-pub fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<String>> {
+fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<String>> {
     if !choices.output_dir.as_path().is_dir() {
         return Err(anyhow!(
             "output directory does not exist: {:?}",

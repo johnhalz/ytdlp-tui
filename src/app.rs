@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -303,9 +303,7 @@ fn adjust_selector(s: &mut SelectorState, delta: i32) {
 }
 
 fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
-    let height_cap = if s.audio_only {
-        None
-    } else if s.resolution_idx == 0 {
+    let height_cap = if s.audio_only || s.resolution_idx == 0 {
         None
     } else {
         Some(s.video.heights[s.resolution_idx - 1])
@@ -328,12 +326,12 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
     }
 }
 
-fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &PathBuf) {
+fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(3),
@@ -348,11 +346,14 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         chunks[0],
     );
 
-    let meta = format!(
+    let mut meta = format!(
         "URL: {}\nSave to: {}",
         s.video.url,
         output_dir.display()
     );
+    if let Some(ref t) = s.video.thumbnail {
+        meta.push_str(&format!("\nThumbnail: {t}"));
+    }
     f.render_widget(
         Paragraph::new(meta).block(Block::default().borders(Borders::ALL)),
         chunks[1],

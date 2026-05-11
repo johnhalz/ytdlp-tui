@@ -1,9 +1,8 @@
 //! Domain types for metadata and user download selections.
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct VideoInfo {
     pub url: String,
     pub title: String,
@@ -12,7 +11,7 @@ pub struct VideoInfo {
     pub subtitle_langs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DownloadChoices {
     pub output_dir: PathBuf,
     /// `None` means best available resolution.
