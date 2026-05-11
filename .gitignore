@@ -1,17 +1,20 @@
-# Rust / Cargo
+# Cargo build output
 /target/
+
+# rustfmt
 **/*.rs.bk
-build/
-dist/
 
-# Python / uv virtualenv (local only)
-.venv/
-venv/
+# MSVC (Windows)
+*.pdb
 
-# IDE / env
+# Local secrets / overrides
+.env
+.env.*
+
+# IDE
 .idea/
 .vscode/
-.env
 
 # OS
 .DS_Store
+Thumbs.db
