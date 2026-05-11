@@ -258,7 +258,7 @@ fn run_ui_loop(
                                 let _ = done_tx.send(r.map_err(|e| e.to_string()));
                             });
                             screen = Screen::Downloading {
-                                status_line: String::new(),
+                                status_line: "Starting download…".into(),
                                 pct: None,
                                 prog_rx,
                                 done_rx,

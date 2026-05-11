@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -190,27 +191,45 @@ pub async fn run_download(
     let args = download_args(video, choices)?;
     let mut child = Command::new(yt_dlp_bin())
         .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn `{}`", yt_dlp_bin()))?;
 
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("no stdout"))?;
     let stderr = child
         .stderr
         .take()
         .ok_or_else(|| anyhow!("no stderr"))?;
 
-    let mut reader = BufReader::new(stderr).lines();
-    let mut err_text = Vec::<String>::new();
-
-    while let Some(line) = reader.next_line().await? {
-        err_text.push(line.clone());
-        if let Some(pct) = parse_progress_line(&line) {
-            let _ = progress.send(format!("Downloading… {pct:.1}%"));
-        } else if line.contains("[download]") {
-            let _ = progress.send("Downloading…".to_string());
+    let progress_out = progress.clone();
+    let stdout_task = async move {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Some(line) = reader.next_line().await? {
+            if let Some(pct) = parse_progress_line(&line) {
+                let _ = progress_out.send(format!("Downloading… {pct:.1}%"));
+            } else if line.contains("[download]") {
+                let _ = progress_out.send("Downloading…".to_string());
+            }
         }
-    }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let stderr_task = async move {
+        let mut reader = BufReader::new(stderr).lines();
+        let mut err_lines = Vec::<String>::new();
+        while let Some(line) = reader.next_line().await? {
+            err_lines.push(line);
+        }
+        Ok::<Vec<String>, std::io::Error>(err_lines)
+    };
+
+    let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
+    stdout_res.context("read yt-dlp stdout")?;
+    let err_text = stderr_res.context("read yt-dlp stderr")?;
 
     let status = child
         .wait()
