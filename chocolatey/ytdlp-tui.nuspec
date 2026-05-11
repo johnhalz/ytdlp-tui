@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>ytdlp-tui</id>
-    <version>0.1.1</version>
+    <version>0.1.2</version>
     <title>ytdlp-tui</title>
     <authors>ytdlp-tui contributors</authors>
     <projectUrl>https://github.com/johnhalz/ytdlp-tui</projectUrl>
