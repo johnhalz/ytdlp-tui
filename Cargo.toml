@@ -1,0 +1,24 @@
+[package]
+name = "ytdlp-tui"
+version = "0.2.0"
+authors = ["ytdlp-tui contributors"]
+edition = "2021"
+description = "Interactive terminal UI for yt-dlp downloads."
+license = "MIT"
+repository = "https://github.com/johnhalz/ytdlp-tui"
+readme = "README.md"
+keywords = ["yt-dlp", "tui", "download", "video"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "ytdlp-tui"
+path = "src/main.rs"

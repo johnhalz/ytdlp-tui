@@ -10,17 +10,15 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Sync dependencies
-        run: uv sync --extra dev
+      - name: cargo test
+        run: cargo test --verbose
 
-      - name: Build with PyInstaller (smoke)
-        run: uv run pyinstaller ytdlp_tui.spec
+      - name: cargo build release
+        run: cargo build --release --verbose
