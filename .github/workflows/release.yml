@@ -1,0 +1,72 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact_name: ytdlp-tui-macos-arm64
+          - os: macos-13
+            artifact_name: ytdlp-tui-macos-x86_64
+          - os: ubuntu-latest
+            artifact_name: ytdlp-tui-linux-x86_64
+          - os: windows-latest
+            artifact_name: ytdlp-tui-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: uv run pyinstaller ytdlp_tui.spec
+
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: mv dist/ytdlp-tui "dist/${{ matrix.artifact_name }}"
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Move-Item -Force dist/ytdlp-tui.exe "dist/${{ matrix.artifact_name }}"
+
+      - name: SHA256 checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: dist
+        run: |
+          shasum -a 256 "${{ matrix.artifact_name }}" | tee "${{ matrix.artifact_name }}.sha256"
+
+      - name: SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: dist
+        run: |
+          $h = Get-FileHash -Algorithm SHA256 "${{ matrix.artifact_name }}"
+          $h.Hash.ToLower() + "  " + "${{ matrix.artifact_name }}" | Set-Content "${{ matrix.artifact_name }}.sha256"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.artifact_name }}
+            dist/${{ matrix.artifact_name }}.sha256
