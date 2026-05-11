@@ -1,6 +1,6 @@
 //! Ratatui event loop and screens.
 
-use crate::models::{DownloadChoices, VideoInfo, AUDIO_FORMATS, MERGE_FORMATS};
+use crate::models::{DownloadChoices, VideoInfo, VideoPick, AUDIO_FORMATS, MERGE_FORMATS};
 use crate::ytdlp;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// Lines reserved for the selector (`draw_selector` vertical constraints sum to this).
-const SELECTOR_VIEWPORT_HEIGHT: u16 = 43;
+const SELECTOR_VIEWPORT_HEIGHT: u16 = 45;
 
 pub fn run_tui(url: String, output_dir: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -53,7 +53,7 @@ enum Screen {
 
 struct SelectorState {
     video: VideoInfo,
-    /// 0 = best, k = video.heights[k - 1]
+    /// 0 = best, k = video.variants[k - 1]
     resolution_idx: usize,
     merge_idx: usize,
     audio_only: bool,
@@ -291,7 +291,7 @@ fn run_ui_loop(
 fn adjust_selector(s: &mut SelectorState, delta: i32) {
     match s.focus {
         Focus::Resolution if !s.audio_only => {
-            let max = s.video.heights.len();
+            let max = s.video.variants.len();
             let i = (s.resolution_idx as i32 + delta).clamp(0, max as i32) as usize;
             s.resolution_idx = i;
         }
@@ -315,10 +315,15 @@ fn adjust_selector(s: &mut SelectorState, delta: i32) {
 }
 
 fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
-    let height_cap = if s.audio_only || s.resolution_idx == 0 {
-        None
+    let video_pick = if s.audio_only || s.resolution_idx == 0 {
+        VideoPick::Best
     } else {
-        Some(s.video.heights[s.resolution_idx - 1])
+        let id = s.video.variants[s.resolution_idx - 1]
+            .video_format_id
+            .clone();
+        VideoPick::ByFormatId {
+            video_format_id: id,
+        }
     };
     let merge_format = MERGE_FORMATS[s.merge_idx].to_string();
     let audio_format = AUDIO_FORMATS[s.audio_fmt_idx].to_string();
@@ -330,7 +335,7 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
     }
     DownloadChoices {
         output_dir,
-        height_cap,
+        video_pick,
         merge_format,
         audio_only: s.audio_only,
         audio_format,
@@ -345,7 +350,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         .constraints([
             Constraint::Length(3),
             Constraint::Length(4),
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Length(6),
             Constraint::Length(3),
             Constraint::Length(6),
@@ -372,9 +377,9 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
     let res_items: Vec<ListItem> = std::iter::once(ListItem::new("Best available"))
         .chain(
             s.video
-                .heights
+                .variants
                 .iter()
-                .map(|h| ListItem::new(format!("{h}p"))),
+                .map(|v| ListItem::new(v.label())),
         )
         .collect();
     let res_border = if matches!(s.focus, Focus::Resolution) {

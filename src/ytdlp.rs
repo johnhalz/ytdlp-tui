@@ -1,10 +1,9 @@
 //! Invoke `yt-dlp` as a subprocess for metadata and downloads.
 
-use crate::models::{DownloadChoices, VideoInfo};
+use crate::models::{DownloadChoices, VideoInfo, VideoPick, VideoVariant};
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -17,33 +16,122 @@ fn yt_dlp_bin() -> &'static str {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct DumpFormat {
-    height: Option<u64>,
-    vcodec: Option<String>,
+fn format_id_str(fmt: &Value) -> Option<String> {
+    match fmt.get("format_id")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
-fn collect_heights(formats: &[Value]) -> Vec<u32> {
-    let mut heights: HashSet<u32> = HashSet::new();
+/// Rounded fps for dedupe keys: two decimals (e.g. 29.97). `None` when source has no fps.
+fn normalized_fps_key(fps: Option<f64>) -> i64 {
+    let Some(f) = fps else {
+        return i64::MIN;
+    };
+    (f * 100.0).round() as i64
+}
+
+fn read_dynamic_range(fmt: &Value) -> String {
+    let dr = fmt
+        .get("dynamic_range")
+        .or_else(|| fmt.get("video_dynamic_range"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match dr {
+        Some(s) => s.to_string(),
+        None => "Unknown".to_string(),
+    }
+}
+
+fn read_fps(fmt: &Value) -> Option<f64> {
+    fmt.get("fps").and_then(|v| v.as_f64())
+}
+
+fn format_score(fmt: &Value) -> u64 {
+    if let Some(tbr) = fmt.get("tbr").and_then(|v| v.as_f64()) {
+        return tbr.max(0.0) as u64;
+    }
+    if let Some(fs) = fmt.get("filesize").and_then(|v| v.as_u64()) {
+        return fs;
+    }
+    if let Some(fs) = fmt.get("filesize_approx").and_then(|v| v.as_u64()) {
+        return fs;
+    }
+    0
+}
+
+/// Deduped video variants, each tied to one yt-dlp video `format_id` (best scored per bucket).
+///
+/// Sort: **height** desc, **fps** desc (missing fps last), then **HDR-style** before **SDR** before **Unknown**.
+fn collect_video_variants(formats: &[Value]) -> Vec<VideoVariant> {
+    type Key = (u32, i64, String);
+    let mut best: HashMap<Key, (u64, VideoVariant)> = HashMap::new();
+
     for f in formats {
-        let Ok(fmt) = serde_json::from_value::<DumpFormat>(f.clone()) else {
+        let Some(fid) = format_id_str(f) else { continue };
+        let Some(h) = f.get("height").and_then(|v| v.as_u64()) else {
             continue;
         };
-        let Some(h) = fmt.height else { continue };
-        let Some(vc) = fmt.vcodec.as_deref() else {
-            continue;
-        };
-        if vc == "none" {
+        let vc = f.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
+        if vc.is_empty() || vc == "none" {
             continue;
         }
-        heights.insert(h as u32);
+
+        let height = h as u32;
+        let fps = read_fps(f);
+        let dynamic_range = read_dynamic_range(f);
+        let key = (
+            height,
+            normalized_fps_key(fps),
+            dynamic_range.clone(),
+        );
+
+        let score = format_score(f);
+        let candidate = VideoVariant {
+            height,
+            fps,
+            dynamic_range,
+            video_format_id: fid,
+        };
+
+        best.entry(key)
+            .and_modify(|e| {
+                if score > e.0 {
+                    *e = (score, candidate.clone());
+                }
+            })
+            .or_insert((score, candidate));
     }
-    let mut v: Vec<u32> = heights.into_iter().collect();
-    v.sort_by(|a, b| b.cmp(a));
-    v
+
+    let mut variants: Vec<VideoVariant> = best.into_values().map(|(_, v)| v).collect();
+
+    fn dr_rank(s: &str) -> u8 {
+        match s {
+            "SDR" => 1,
+            "Unknown" => 2,
+            _ => 0,
+        }
+    }
+
+    variants.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| {
+                let af = a.fps.unwrap_or(f64::NEG_INFINITY);
+                let bf = b.fps.unwrap_or(f64::NEG_INFINITY);
+                bf.partial_cmp(&af).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| dr_rank(&a.dynamic_range).cmp(&dr_rank(&b.dynamic_range)))
+            .then_with(|| a.video_format_id.cmp(&b.video_format_id))
+    });
+
+    variants
 }
 
 fn collect_subtitle_langs(info: &Value) -> Vec<String> {
+    use std::collections::HashSet;
     let mut langs: HashSet<String> = HashSet::new();
     if let Some(m) = info.get("subtitles").and_then(|x| x.as_object()) {
         for k in m.keys() {
@@ -104,14 +192,14 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
         .cloned()
         .unwrap_or_default();
 
-    let heights = collect_heights(&formats);
+    let variants = collect_video_variants(&formats);
     let subtitle_langs = collect_subtitle_langs(&info);
 
     Ok(VideoInfo {
         url: url.to_string(),
         title,
         thumbnail,
-        heights,
+        variants,
         subtitle_langs,
     })
 }
@@ -152,9 +240,11 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
     } else {
         args.push("--merge-output-format".into());
         args.push(choices.merge_format.clone());
-        let fmt = match choices.height_cap {
-            None => "bestvideo+bestaudio/best".to_string(),
-            Some(h) => format!("bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"),
+        let fmt = match &choices.video_pick {
+            VideoPick::Best => "bestvideo+bestaudio/best".to_string(),
+            VideoPick::ByFormatId { video_format_id } => {
+                format!("{video_format_id}+bestaudio/best")
+            }
         };
         args.push("-f".into());
         args.push(fmt);
@@ -248,7 +338,8 @@ pub async fn run_download(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_progress_line;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn parses_percent() {
@@ -258,5 +349,119 @@ mod tests {
         );
         assert_eq!(parse_progress_line("[download] 100% of 1MiB"), Some(100.0));
         assert_eq!(parse_progress_line("not progress"), None);
+    }
+
+    #[test]
+    fn collect_variants_dedupes_and_keeps_higher_tbr() {
+        let formats = vec![
+            json!({
+                "format_id": "low",
+                "height": 1080,
+                "vcodec": "avc1",
+                "fps": 60.0,
+                "dynamic_range": "SDR",
+                "tbr": 100.0,
+            }),
+            json!({
+                "format_id": "high",
+                "height": 1080,
+                "vcodec": "avc1",
+                "fps": 60.0,
+                "dynamic_range": "SDR",
+                "tbr": 5000.0,
+            }),
+        ];
+        let v = collect_video_variants(&formats);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].video_format_id, "high");
+    }
+
+    #[test]
+    fn collect_variants_sorts_height_fps_and_hdr_before_sdr() {
+        let formats = vec![
+            json!({
+                "format_id": "a",
+                "height": 1080,
+                "vcodec": "av01",
+                "fps": 30.0,
+                "dynamic_range": "SDR",
+                "tbr": 100.0,
+            }),
+            json!({
+                "format_id": "b",
+                "height": 1080,
+                "vcodec": "av01",
+                "fps": 60.0,
+                "dynamic_range": "SDR",
+                "tbr": 100.0,
+            }),
+            json!({
+                "format_id": "c",
+                "height": 2160,
+                "vcodec": "av01",
+                "fps": 30.0,
+                "dynamic_range": "HDR10",
+                "tbr": 100.0,
+            }),
+            json!({
+                "format_id": "d",
+                "height": 1080,
+                "vcodec": "av01",
+                "fps": 30.0,
+                "dynamic_range": "HDR10",
+                "tbr": 100.0,
+            }),
+        ];
+        let v = collect_video_variants(&formats);
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0].height, 2160);
+        assert_eq!(v[1].height, 1080);
+        assert_eq!(v[1].fps, Some(60.0));
+        assert_eq!(v[2].dynamic_range, "HDR10");
+        assert_eq!(v[2].height, 1080);
+        assert_eq!(v[3].dynamic_range, "SDR");
+    }
+
+    #[test]
+    fn collect_variants_skips_audio_and_missing_format_id() {
+        let formats = vec![
+            json!({
+                "height": 1080,
+                "vcodec": "avc1",
+                "fps": 60.0,
+                "dynamic_range": "SDR",
+            }),
+            json!({
+                "format_id": "aud",
+                "vcodec": "none",
+            }),
+        ];
+        let v = collect_video_variants(&formats);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn download_args_by_format_id() {
+        let video = VideoInfo {
+            url: "https://example.com".into(),
+            title: "t".into(),
+            thumbnail: None,
+            variants: vec![],
+            subtitle_langs: vec![],
+        };
+        let choices = DownloadChoices {
+            output_dir: std::env::temp_dir(),
+            video_pick: VideoPick::ByFormatId {
+                video_format_id: "401".into(),
+            },
+            merge_format: "mkv".into(),
+            audio_only: false,
+            audio_format: "mp3".into(),
+            subtitle_langs: vec![],
+            embed_chapters: false,
+        };
+        let args = download_args(&video, &choices).expect("args");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args.get(f_pos + 1), Some(&"401+bestaudio/best".to_string()));
     }
 }
