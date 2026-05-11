@@ -5,7 +5,7 @@
 class YtdlpTui < Formula
   desc "Interactive terminal UI for yt-dlp"
   homepage "https://github.com/johnhalz/ytdlp-tui"
-  version "0.1.0"
+  version "0.1.1"
 
   on_macos do
     if Hardware::CPU.arm?
