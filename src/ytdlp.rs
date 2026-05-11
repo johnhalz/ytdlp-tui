@@ -1,6 +1,8 @@
 //! Invoke `yt-dlp` as a subprocess for metadata and downloads.
 
-use crate::models::{Chapter, DownloadChoices, VideoInfo, VideoPick, VideoVariant};
+use crate::models::{
+    AudioTrack, Chapter, DownloadChoices, VideoInfo, VideoPick, VideoVariant,
+};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -134,6 +136,57 @@ fn collect_video_variants(formats: &[Value]) -> Vec<VideoVariant> {
     variants
 }
 
+/// Distinct audio-only formats keyed by normalized language; keeps highest-scored row per language.
+fn collect_audio_tracks(formats: &[Value]) -> Vec<AudioTrack> {
+    let mut best: HashMap<String, (u64, AudioTrack)> = HashMap::new();
+
+    for f in formats {
+        let Some(fid) = format_id_str(f) else {
+            continue;
+        };
+        let vc = f.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
+        if !vc.is_empty() && vc != "none" {
+            continue;
+        }
+        let ac = f.get("acodec").and_then(|v| v.as_str()).unwrap_or("");
+        if ac.is_empty() || ac == "none" {
+            continue;
+        }
+        let Some(lang_raw) = f.get("language").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if lang_raw.is_empty() {
+            continue;
+        }
+        let lang_key = lang_raw.to_ascii_lowercase();
+        if lang_key == "und" {
+            continue;
+        }
+
+        let score = format_score(f);
+        let candidate = AudioTrack {
+            language: lang_raw.to_string(),
+            format_id: fid,
+        };
+
+        best.entry(lang_key)
+            .and_modify(|e| {
+                if score > e.0 {
+                    *e = (score, candidate.clone());
+                }
+            })
+            .or_insert((score, candidate));
+    }
+
+    let mut tracks: Vec<AudioTrack> = best.into_values().map(|(_, t)| t).collect();
+    tracks.sort_by(|a, b| {
+        a.language
+            .to_ascii_lowercase()
+            .cmp(&b.language.to_ascii_lowercase())
+    });
+    tracks
+}
+
 fn collect_subtitle_langs(info: &Value) -> Vec<String> {
     use std::collections::HashSet;
     let mut langs: HashSet<String> = HashSet::new();
@@ -222,6 +275,7 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
         .unwrap_or_default();
 
     let variants = collect_video_variants(&formats);
+    let audio_tracks = collect_audio_tracks(&formats);
     let subtitle_langs = collect_subtitle_langs(&info);
     let chapters = collect_chapters(&info);
 
@@ -230,6 +284,7 @@ pub async fn fetch_video_info(url: &str) -> Result<VideoInfo> {
         title,
         thumbnail,
         variants,
+        audio_tracks,
         subtitle_langs,
         chapters,
     })
@@ -263,8 +318,13 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
     ];
 
     if choices.audio_only {
+        let src = choices
+            .audio_track
+            .as_deref()
+            .map(|id| format!("{id}/best"))
+            .unwrap_or_else(|| "bestaudio/best".to_string());
         args.push("-f".into());
-        args.push("bestaudio/best".into());
+        args.push(src);
         args.push("-x".into());
         args.push("--audio-format".into());
         args.push(choices.audio_format.clone());
@@ -273,10 +333,15 @@ fn download_args(video: &VideoInfo, choices: &DownloadChoices) -> Result<Vec<Str
     } else {
         args.push("--merge-output-format".into());
         args.push(choices.merge_format.clone());
+        let audio_part = choices
+            .audio_track
+            .as_deref()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "bestaudio".to_string());
         let fmt = match &choices.video_pick {
-            VideoPick::Best => "bestvideo+bestaudio/best".to_string(),
+            VideoPick::Best => format!("bestvideo+{audio_part}/best"),
             VideoPick::ByFormatId { video_format_id } => {
-                format!("{video_format_id}+bestaudio/best")
+                format!("{video_format_id}+{audio_part}/best")
             }
         };
         args.push("-f".into());
@@ -821,6 +886,7 @@ mod tests {
             title: "t".into(),
             thumbnail: None,
             variants: vec![],
+            audio_tracks: vec![],
             subtitle_langs: vec![],
             chapters: vec![],
         };
@@ -830,6 +896,7 @@ mod tests {
                 video_format_id: "401".into(),
             },
             merge_format: "mkv".into(),
+            audio_track: None,
             audio_only: false,
             audio_format: "mp3".into(),
             subtitle_langs: vec![],
@@ -840,5 +907,122 @@ mod tests {
         let args = download_args(&video, &choices).expect("args");
         let f_pos = args.iter().position(|a| a == "-f").unwrap();
         assert_eq!(args.get(f_pos + 1), Some(&"401+bestaudio/best".to_string()));
+    }
+
+    #[test]
+    fn collect_audio_tracks_dedupes_by_language_and_keeps_best_score() {
+        let formats = vec![
+            json!({
+                "format_id": "140",
+                "vcodec": "none",
+                "acodec": "aac",
+                "language": "fr",
+                "tbr": 100.0,
+            }),
+            json!({
+                "format_id": "141",
+                "vcodec": "none",
+                "acodec": "aac",
+                "language": "fr",
+                "tbr": 500.0,
+            }),
+            json!({
+                "format_id": "139",
+                "vcodec": "none",
+                "acodec": "aac",
+                "language": "en",
+                "tbr": 50.0,
+            }),
+        ];
+        let t = collect_audio_tracks(&formats);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].language, "en");
+        assert_eq!(t[0].format_id, "139");
+        assert_eq!(t[1].language, "fr");
+        assert_eq!(t[1].format_id, "141");
+    }
+
+    #[test]
+    fn collect_audio_tracks_skips_video_and_und() {
+        let formats = vec![
+            json!({
+                "format_id": "401",
+                "vcodec": "av01",
+                "acodec": "none",
+                "height": 1080,
+            }),
+            json!({
+                "format_id": "140",
+                "vcodec": "none",
+                "acodec": "aac",
+                "language": "und",
+            }),
+            json!({
+                "format_id": "141",
+                "vcodec": "none",
+                "acodec": "none",
+                "language": "en",
+            }),
+        ];
+        assert!(collect_audio_tracks(&formats).is_empty());
+    }
+
+    #[test]
+    fn download_args_audio_track_merged() {
+        let video = VideoInfo {
+            url: "https://example.com".into(),
+            title: "t".into(),
+            thumbnail: None,
+            variants: vec![],
+            audio_tracks: vec![],
+            subtitle_langs: vec![],
+            chapters: vec![],
+        };
+        let choices = DownloadChoices {
+            output_dir: std::env::temp_dir(),
+            video_pick: VideoPick::Best,
+            merge_format: "mp4".into(),
+            audio_track: Some("140".into()),
+            audio_only: false,
+            audio_format: "mp3".into(),
+            subtitle_langs: vec![],
+            embed_chapters: false,
+            chapters: vec![],
+            cut_segments: vec![],
+        };
+        let args = download_args(&video, &choices).expect("args");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(
+            args.get(f_pos + 1),
+            Some(&"bestvideo+140/best".to_string())
+        );
+    }
+
+    #[test]
+    fn download_args_audio_track_audio_only() {
+        let video = VideoInfo {
+            url: "https://example.com".into(),
+            title: "t".into(),
+            thumbnail: None,
+            variants: vec![],
+            audio_tracks: vec![],
+            subtitle_langs: vec![],
+            chapters: vec![],
+        };
+        let choices = DownloadChoices {
+            output_dir: std::env::temp_dir(),
+            video_pick: VideoPick::Best,
+            merge_format: "mp4".into(),
+            audio_track: Some("251".into()),
+            audio_only: true,
+            audio_format: "mp3".into(),
+            subtitle_langs: vec![],
+            embed_chapters: false,
+            chapters: vec![],
+            cut_segments: vec![],
+        };
+        let args = download_args(&video, &choices).expect("args");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args.get(f_pos + 1), Some(&"251/best".to_string()));
     }
 }

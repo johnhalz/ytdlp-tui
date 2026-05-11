@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// Lines reserved for the selector (`draw_selector` vertical constraints sum to this).
-const SELECTOR_VIEWPORT_HEIGHT: u16 = 53;
+const SELECTOR_VIEWPORT_HEIGHT: u16 = 59;
 
 #[derive(Debug)]
 pub enum TuiExit {
@@ -69,6 +69,8 @@ struct SelectorState {
     /// 0 = best, k = video.variants[k - 1]
     resolution_idx: usize,
     merge_idx: usize,
+    /// 0 = original/default audio (`bestaudio`); k >= 1 maps to `video.audio_tracks[k - 1]`.
+    dub_idx: usize,
     audio_only: bool,
     audio_fmt_idx: usize,
     sub_cursor: usize,
@@ -85,6 +87,7 @@ struct SelectorState {
 enum Focus {
     Resolution,
     Merge,
+    Dub,
     AudioOnly,
     AudioFmt,
     Subtitles,
@@ -98,7 +101,8 @@ impl Focus {
     fn next(self) -> Focus {
         match self {
             Focus::Resolution => Focus::Merge,
-            Focus::Merge => Focus::AudioOnly,
+            Focus::Merge => Focus::Dub,
+            Focus::Dub => Focus::AudioOnly,
             Focus::AudioOnly => Focus::AudioFmt,
             Focus::AudioFmt => Focus::Subtitles,
             Focus::Subtitles => Focus::EmbedChapters,
@@ -113,7 +117,8 @@ impl Focus {
         match self {
             Focus::Resolution => Focus::Quit,
             Focus::Merge => Focus::Resolution,
-            Focus::AudioOnly => Focus::Merge,
+            Focus::Dub => Focus::Merge,
+            Focus::AudioOnly => Focus::Dub,
             Focus::AudioFmt => Focus::AudioOnly,
             Focus::Subtitles => Focus::AudioFmt,
             Focus::EmbedChapters => Focus::Subtitles,
@@ -215,6 +220,7 @@ fn run_ui_loop(
                             video: v,
                             resolution_idx: 0,
                             merge_idx: 0,
+                            dub_idx: 0,
                             audio_only: false,
                             audio_fmt_idx: 0,
                             sub_cursor: 0,
@@ -402,6 +408,11 @@ fn adjust_selector(s: &mut SelectorState, delta: i32) {
             let i = (s.merge_idx as i32 + delta).clamp(0, max as i32) as usize;
             s.merge_idx = i;
         }
+        Focus::Dub if !s.video.audio_tracks.is_empty() => {
+            let max = s.video.audio_tracks.len();
+            let i = (s.dub_idx as i32 + delta).clamp(0, max as i32) as usize;
+            s.dub_idx = i;
+        }
         Focus::AudioFmt if s.audio_only => {
             let max = AUDIO_FORMATS.len() - 1;
             let i = (s.audio_fmt_idx as i32 + delta).clamp(0, max as i32) as usize;
@@ -433,6 +444,15 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
         }
     };
     let merge_format = MERGE_FORMATS[s.merge_idx].to_string();
+    let audio_track = if s.dub_idx == 0 {
+        None
+    } else {
+        Some(
+            s.video.audio_tracks[s.dub_idx - 1]
+                .format_id
+                .clone(),
+        )
+    };
     let audio_format = AUDIO_FORMATS[s.audio_fmt_idx].to_string();
     let mut subtitle_langs = Vec::new();
     for (i, lang) in s.video.subtitle_langs.iter().enumerate() {
@@ -450,6 +470,7 @@ fn build_choices(s: &SelectorState, output_dir: PathBuf) -> DownloadChoices {
         output_dir,
         video_pick,
         merge_format,
+        audio_track,
         audio_only: s.audio_only,
         audio_format,
         subtitle_langs,
@@ -466,6 +487,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Length(8),
+            Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(3),
             Constraint::Length(6),
@@ -562,6 +584,45 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         );
     }
 
+    let dub_border = if matches!(s.focus, Focus::Dub) {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    if s.video.audio_tracks.is_empty() {
+        f.render_widget(
+            Paragraph::new("(no alternate audio tracks reported)").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(dub_border)
+                    .title("Audio track (↑↓ when focused)")
+                    .style(Style::default().fg(Color::DarkGray)),
+            ),
+            chunks[4],
+        );
+    } else {
+        let dub_items: Vec<ListItem> = std::iter::once(ListItem::new("Original (default)"))
+            .chain(
+                s.video
+                    .audio_tracks
+                    .iter()
+                    .map(|t| ListItem::new(t.label())),
+            )
+            .collect();
+        let mut dub_state = ListState::default();
+        dub_state.select(Some(s.dub_idx));
+        let dub_list = List::new(dub_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(dub_border)
+                    .title("Audio track (↑↓ when focused)"),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .highlight_symbol("> ");
+        f.render_stateful_widget(dub_list, chunks[4], &mut dub_state);
+    }
+
     let ao_border = if matches!(s.focus, Focus::AudioOnly) {
         Style::default().fg(Color::Yellow)
     } else {
@@ -577,7 +638,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
                 .borders(Borders::ALL)
                 .border_style(ao_border),
         ),
-        chunks[4],
+        chunks[5],
     );
 
     let audio_items: Vec<ListItem> = AUDIO_FORMATS
@@ -601,7 +662,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     if s.audio_only {
-        f.render_stateful_widget(af_list, chunks[5], &mut af_state);
+        f.render_stateful_widget(af_list, chunks[6], &mut af_state);
     } else {
         f.render_widget(
             List::new(vec![ListItem::new("(enable audio only)")]).block(
@@ -610,7 +671,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
                     .title("Audio format")
                     .style(Style::default().fg(Color::DarkGray)),
             ),
-            chunks[5],
+            chunks[6],
         );
     }
 
@@ -627,7 +688,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
                     .border_style(sub_border)
                     .title("Subtitles (↑↓ Space toggles)"),
             ),
-            chunks[6],
+            chunks[7],
         );
     } else {
         let sub_items: Vec<ListItem> = s
@@ -652,7 +713,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             )
             .highlight_style(Style::default().add_modifier(Modifier::BOLD))
             .highlight_symbol("> ");
-        f.render_stateful_widget(sub_list, chunks[6], &mut sub_state);
+        f.render_stateful_widget(sub_list, chunks[7], &mut sub_state);
     }
 
     let ec_border = if matches!(s.focus, Focus::EmbedChapters) {
@@ -670,7 +731,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
                 .borders(Borders::ALL)
                 .border_style(ec_border),
         ),
-        chunks[7],
+        chunks[8],
     );
 
     let sb_border = if matches!(s.focus, Focus::SponsorBlock) {
@@ -687,7 +748,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
                     .title("SponsorBlock (↑↓ Space toggles cut)")
                     .style(Style::default().fg(Color::DarkGray)),
             ),
-            chunks[8],
+            chunks[9],
         );
     } else {
         let sb_items: Vec<ListItem> = s
@@ -718,7 +779,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             )
             .highlight_style(Style::default().add_modifier(Modifier::BOLD))
             .highlight_symbol("> ");
-        f.render_stateful_widget(sb_list, chunks[8], &mut sb_state);
+        f.render_stateful_widget(sb_list, chunks[9], &mut sb_state);
     }
 
     let action_border = if matches!(s.focus, Focus::Download | Focus::Quit) {
@@ -739,7 +800,7 @@ fn draw_selector(f: &mut Frame, area: Rect, s: &SelectorState, output_dir: &Path
             .borders(Borders::ALL)
             .border_style(action_border),
     );
-    f.render_widget(actions, chunks[9]);
+    f.render_widget(actions, chunks[10]);
 }
 
 fn format_timestamp(sec: f64) -> String {

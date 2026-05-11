@@ -19,6 +19,63 @@ pub struct Chapter {
     pub start_time: f64,
 }
 
+/// One selectable dubbed / alternate audio stream from yt-dlp `formats` (audio-only row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioTrack {
+    /// BCP-47-ish language tag from yt-dlp (e.g. `en`, `fr`, `pt-BR`).
+    pub language: String,
+    pub format_id: String,
+}
+
+impl AudioTrack {
+    /// Short label for the TUI list: `{code} ({English name})` when known, else `{code}`.
+    pub fn label(&self) -> String {
+        let name = language_display_name(&self.language);
+        match name {
+            Some(n) => format!("{} ({n})", self.language),
+            None => self.language.clone(),
+        }
+    }
+}
+
+fn language_display_name(code: &str) -> Option<&'static str> {
+    let lower = code.to_ascii_lowercase();
+    match lower.as_str() {
+        "ar" => Some("Arabic"),
+        "bn" => Some("Bengali"),
+        "cs" => Some("Czech"),
+        "da" => Some("Danish"),
+        "de" => Some("German"),
+        "el" => Some("Greek"),
+        "en" | "en-us" | "en-gb" => Some("English"),
+        "es" | "es-419" => Some("Spanish"),
+        "fi" => Some("Finnish"),
+        "fr" => Some("French"),
+        "hi" => Some("Hindi"),
+        "hu" => Some("Hungarian"),
+        "id" => Some("Indonesian"),
+        "it" => Some("Italian"),
+        "ja" => Some("Japanese"),
+        "ko" => Some("Korean"),
+        "ms" => Some("Malay"),
+        "nl" => Some("Dutch"),
+        "no" => Some("Norwegian"),
+        "pl" => Some("Polish"),
+        "pt" | "pt-br" | "pt_br" => Some("Portuguese"),
+        "ro" => Some("Romanian"),
+        "ru" => Some("Russian"),
+        "sv" => Some("Swedish"),
+        "ta" => Some("Tamil"),
+        "te" => Some("Telugu"),
+        "th" => Some("Thai"),
+        "tr" => Some("Turkish"),
+        "uk" => Some("Ukrainian"),
+        "vi" => Some("Vietnamese"),
+        "zh" | "zh-cn" | "zh-tw" => Some("Chinese"),
+        _ => None,
+    }
+}
+
 impl VideoVariant {
     /// TUI label: `{h}p · {fps}fps · {DR}` with segments omitted when `fps` is missing or DR is `Unknown`.
     pub fn label(&self) -> String {
@@ -48,6 +105,8 @@ pub struct VideoInfo {
     pub thumbnail: Option<String>,
     /// Best-first distinct video variants (height · fps · dynamic range).
     pub variants: Vec<VideoVariant>,
+    /// Distinct audio-only formats by language (best-quality pick per language).
+    pub audio_tracks: Vec<AudioTrack>,
     pub subtitle_langs: Vec<String>,
     pub chapters: Vec<Chapter>,
 }
@@ -57,7 +116,7 @@ pub struct VideoInfo {
 pub enum VideoPick {
     /// `bestvideo+bestaudio/best`
     Best,
-    /// Video-only format id: `{id}+bestaudio/best`
+    /// Video-only format id; paired with chosen audio in `-f` (see `DownloadChoices::audio_track`).
     ByFormatId {
         video_format_id: String,
     },
@@ -68,6 +127,8 @@ pub struct DownloadChoices {
     pub output_dir: PathBuf,
     pub video_pick: VideoPick,
     pub merge_format: String,
+    /// `None` uses yt-dlp default merged audio (`bestaudio`); `Some(id)` picks that audio format id.
+    pub audio_track: Option<String>,
     pub audio_only: bool,
     pub audio_format: String,
     pub subtitle_langs: Vec<String>,
@@ -83,7 +144,7 @@ pub const AUDIO_FORMATS: &[&str] = &["mp3", "aac", "opus", "m4a"];
 
 #[cfg(test)]
 mod tests {
-    use super::VideoVariant;
+    use super::{AudioTrack, VideoVariant};
 
     #[test]
     fn variant_label_integer_fps_and_omits_unknown_dr() {
@@ -116,5 +177,23 @@ mod tests {
             video_format_id: "2".to_string(),
         };
         assert_eq!(v.label(), "720p · 30fps");
+    }
+
+    #[test]
+    fn audio_track_label_known_language() {
+        let t = AudioTrack {
+            language: "fr".into(),
+            format_id: "140".into(),
+        };
+        assert_eq!(t.label(), "fr (French)");
+    }
+
+    #[test]
+    fn audio_track_label_unknown_language() {
+        let t = AudioTrack {
+            language: "zz".into(),
+            format_id: "141".into(),
+        };
+        assert_eq!(t.label(), "zz");
     }
 }
