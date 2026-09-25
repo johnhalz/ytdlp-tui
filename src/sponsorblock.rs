@@ -98,6 +98,8 @@ pub async fn fetch_segments(url: &str) -> Result<Vec<SponsorSegment>> {
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("ytdlp-tui/", env!("CARGO_PKG_VERSION")))
+        // Loading waits on this and yt-dlp together; don't let a slow API stall the UI.
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("build HTTP client")?;
 
