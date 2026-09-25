@@ -2,21 +2,23 @@
 
 use std::path::PathBuf;
 
-/// One selectable video tier: height, frame rate, dynamic range, and yt-dlp `format_id` for the video stream.
+/// One selectable video tier: height, frame rate, dynamic range. Selected via yt-dlp format filters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoVariant {
     pub height: u32,
     pub fps: Option<f64>,
     /// From yt-dlp (`dynamic_range` / `video_dynamic_range`); `"Unknown"` if missing.
     pub dynamic_range: String,
-    pub video_format_id: String,
+    /// Some format in this tier is H.264 (`avc1`), i.e. QuickTime-playable in mp4.
+    pub h264: bool,
 }
 
-/// Chapter marker from yt-dlp metadata (`--embed-chapters` source).
+/// Chapter marker from yt-dlp metadata; re-timed when sponsor segments are cut.
 #[derive(Debug, Clone)]
 pub struct Chapter {
     pub title: String,
     pub start_time: f64,
+    pub end_time: f64,
 }
 
 /// One selectable dubbed / alternate audio stream from yt-dlp `formats` (audio-only row).
@@ -24,7 +26,6 @@ pub struct Chapter {
 pub struct AudioTrack {
     /// BCP-47-ish language tag from yt-dlp (e.g. `en`, `fr`, `pt-BR`).
     pub language: String,
-    pub format_id: String,
 }
 
 impl AudioTrack {
@@ -102,7 +103,6 @@ impl VideoVariant {
 pub struct VideoInfo {
     pub url: String,
     pub title: String,
-    pub thumbnail: Option<String>,
     /// Best-first distinct video variants (height · fps · dynamic range).
     pub variants: Vec<VideoVariant>,
     /// Distinct audio-only formats by language (best-quality pick per language).
@@ -116,10 +116,8 @@ pub struct VideoInfo {
 pub enum VideoPick {
     /// `bestvideo+bestaudio/best`
     Best,
-    /// Video-only format id; paired with chosen audio in `-f` (see `DownloadChoices::audio_track`).
-    ByFormatId {
-        video_format_id: String,
-    },
+    /// Best video matching this tier; codec is chosen by the container's `-S` sort.
+    Variant(VideoVariant),
 }
 
 #[derive(Debug, Clone)]
@@ -127,15 +125,13 @@ pub struct DownloadChoices {
     pub output_dir: PathBuf,
     pub video_pick: VideoPick,
     pub merge_format: String,
-    /// `None` uses yt-dlp default merged audio (`bestaudio`); `Some(id)` picks that audio format id.
+    /// `None` prefers the original audio; `Some(lang)` picks the best audio in that language.
     pub audio_track: Option<String>,
     pub audio_only: bool,
     pub audio_format: String,
     pub subtitle_langs: Vec<String>,
     pub embed_chapters: bool,
-    /// Original chapter times from metadata; used when rewriting chapters after sponsor cuts.
-    pub chapters: Vec<Chapter>,
-    /// Time ranges (seconds) to remove from the downloaded file(s).
+    /// Time ranges (seconds) to remove from the downloaded file(s) with ffmpeg after yt-dlp finishes.
     pub cut_segments: Vec<(f64, f64)>,
 }
 
@@ -152,7 +148,7 @@ mod tests {
             height: 2160,
             fps: Some(60.0),
             dynamic_range: "HDR10".to_string(),
-            video_format_id: "99".to_string(),
+            h264: false,
         };
         assert_eq!(v.label(), "2160p · 60fps · HDR10");
     }
@@ -163,7 +159,7 @@ mod tests {
             height: 1080,
             fps: None,
             dynamic_range: "SDR".to_string(),
-            video_format_id: "1".to_string(),
+            h264: false,
         };
         assert_eq!(v.label(), "1080p · SDR");
     }
@@ -174,7 +170,7 @@ mod tests {
             height: 720,
             fps: Some(30.0),
             dynamic_range: "Unknown".to_string(),
-            video_format_id: "2".to_string(),
+            h264: false,
         };
         assert_eq!(v.label(), "720p · 30fps");
     }
@@ -183,7 +179,6 @@ mod tests {
     fn audio_track_label_known_language() {
         let t = AudioTrack {
             language: "fr".into(),
-            format_id: "140".into(),
         };
         assert_eq!(t.label(), "fr (French)");
     }
@@ -192,7 +187,6 @@ mod tests {
     fn audio_track_label_unknown_language() {
         let t = AudioTrack {
             language: "zz".into(),
-            format_id: "141".into(),
         };
         assert_eq!(t.label(), "zz");
     }
